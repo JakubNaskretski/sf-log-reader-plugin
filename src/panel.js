@@ -8,9 +8,18 @@
   const fetchBtn = document.getElementById('fetch-btn');
   const refreshListBtn = document.getElementById('refresh-list');
   const openFolderBtn = document.getElementById('open-folder');
+  const openExternalBtn = document.getElementById('open-external');
   const clearLogsBtn = document.getElementById('clear-logs');
+  const externalBanner = document.getElementById('external-banner');
+  const externalPathEl = document.getElementById('external-path');
+  const externalSummaryBtn = document.getElementById('external-summary');
+  const externalKeepBtn = document.getElementById('external-keep');
+  const externalCloseBtn = document.getElementById('external-close');
   const statusEl = document.getElementById('status');
   const logListEl = document.getElementById('log-list');
+  const selectAllEl = document.getElementById('select-all');
+  const selectionCountEl = document.getElementById('selection-count');
+  const keepSelectedBtn = document.getElementById('keep-selected');
   const detailHeaderEl = document.getElementById('detail-header');
   const detailBodyEl = document.getElementById('detail-body');
   const searchEl = document.getElementById('search');
@@ -31,7 +40,9 @@
     entries: [],
     filters: new Set(['USER_DEBUG', 'SOQL', 'DML', 'EXCEPTION', 'CALLOUT']),
     search: '',
-    trail: []
+    trail: [],
+    external: null,
+    selected: new Set()
   };
 
   function post(message) { vscode.postMessage(message); }
@@ -62,7 +73,44 @@
   fetchBtn.addEventListener('click', () => post({ type: 'fetchLogs' }));
   refreshListBtn.addEventListener('click', () => post({ type: 'refreshLogs' }));
   openFolderBtn.addEventListener('click', () => post({ type: 'openLogFolder' }));
+  openExternalBtn.addEventListener('click', () => post({ type: 'openExternalLog' }));
   clearLogsBtn.addEventListener('click', () => post({ type: 'deleteAllLogs' }));
+
+  selectAllEl.addEventListener('change', () => {
+    state.selected = new Set(selectAllEl.checked ? state.logs.map(l => l.id) : []);
+    renderLogs();
+    renderSelection();
+  });
+  keepSelectedBtn.addEventListener('click', () => {
+    const picks = state.logs.filter(l => state.selected.has(l.id)).map(l => ({ logId: l.id, userId: l.userId }));
+    if (picks.length === 0) return;
+    keepSelectedBtn.disabled = true;
+    keepSelectedBtn.textContent = 'Saving…';
+    post({ type: 'keepLogs', logs: picks });
+    setTimeout(() => {
+      keepSelectedBtn.innerHTML = '\u{1F4BE} Keep selected';
+      renderSelection();
+    }, 2000);
+  });
+  externalCloseBtn.addEventListener('click', () => post({ type: 'closeExternalLog' }));
+  externalKeepBtn.addEventListener('click', () => {
+    externalKeepBtn.disabled = true;
+    externalKeepBtn.textContent = 'Saving…';
+    post({ type: 'keepExternalLog' });
+    setTimeout(() => {
+      externalKeepBtn.disabled = false;
+      externalKeepBtn.innerHTML = '\u{1F4BE} Keep';
+    }, 2000);
+  });
+  externalSummaryBtn.addEventListener('click', () => {
+    externalSummaryBtn.disabled = true;
+    externalSummaryBtn.textContent = 'Generating…';
+    post({ type: 'generateExternalSummary' });
+    setTimeout(() => {
+      externalSummaryBtn.disabled = false;
+      externalSummaryBtn.textContent = 'Summary';
+    }, 2000);
+  });
 
   trailHeader.addEventListener('click', e => {
     if (e.target === clearTrailBtn) return;
@@ -123,9 +171,30 @@
     for (const log of state.logs) {
       const row = document.createElement('div');
       row.className = 'log-row' + (log.id === state.activeLogId ? ' active' : '');
+
+      const check = document.createElement('input');
+      check.type = 'checkbox';
+      check.className = 'row-check';
+      check.checked = state.selected.has(log.id);
+      check.addEventListener('click', e => e.stopPropagation());
+      check.addEventListener('change', () => {
+        if (check.checked) state.selected.add(log.id);
+        else state.selected.delete(log.id);
+        renderSelection();
+      });
+      row.appendChild(check);
+
+      const body = document.createElement('div');
+      body.className = 'row-body';
+      row.appendChild(body);
+
       row.addEventListener('click', () => {
         state.activeLogId = log.id;
         state.activeUserId = log.userId;
+        if (state.external) {
+          state.external = null;
+          externalBanner.classList.remove('visible');
+        }
         renderLogs();
         detailBodyEl.innerHTML = '<div class="empty">Loading…</div>';
         post({ type: 'selectLog', logId: log.id, userId: log.userId });
@@ -163,13 +232,31 @@
       if (size.textContent) bot.appendChild(size);
       if (dur.textContent) bot.appendChild(dur);
 
-      row.appendChild(top);
-      row.appendChild(bot);
+      body.appendChild(top);
+      body.appendChild(bot);
       logListEl.appendChild(row);
+    }
+    renderSelection();
+  }
+
+  function renderSelection() {
+    const n = state.selected.size;
+    selectionCountEl.textContent = `${n} selected`;
+    keepSelectedBtn.disabled = n === 0;
+    if (keepSelectedBtn.textContent === 'Saving…' && n === 0) {
+      keepSelectedBtn.innerHTML = '\u{1F4BE} Keep selected';
+    }
+    if (state.logs.length > 0) {
+      const allSelected = state.logs.every(l => state.selected.has(l.id));
+      selectAllEl.checked = allSelected;
+      selectAllEl.indeterminate = !allSelected && n > 0;
+    } else {
+      selectAllEl.checked = false;
+      selectAllEl.indeterminate = false;
     }
   }
 
-  function renderDetailHeader(stats, logId) {
+  function renderDetailHeader(stats, logId, isExternal) {
     if (!stats) {
       detailHeaderEl.innerHTML = '<span class="empty">No log selected.</span>';
       return;
@@ -182,22 +269,37 @@
       if (count > 0) wrap.appendChild(makeStat(cat, count));
     }
     detailHeaderEl.appendChild(wrap);
-    const summaryBtn = document.createElement('button');
-    summaryBtn.textContent = 'Generate summary';
-    summaryBtn.title = 'Write a Markdown + Mermaid summary next to this log';
-    summaryBtn.addEventListener('click', () => {
-      summaryBtn.disabled = true;
-      summaryBtn.textContent = 'Generating…';
-      post({ type: 'generateSummary', logId, userId: state.activeUserId });
-    });
-    detailHeaderEl.appendChild(summaryBtn);
-    const openBtn = document.createElement('button');
-    openBtn.textContent = 'Open file';
-    openBtn.title = 'Open the .log file in an editor tab';
-    openBtn.addEventListener('click', () => {
-      post({ type: 'openLogInEditor', logId, userId: state.activeUserId });
-    });
-    detailHeaderEl.appendChild(openBtn);
+    if (!isExternal) {
+      const keepBtn = document.createElement('button');
+      keepBtn.innerHTML = '\u{1F4BE} Keep';
+      keepBtn.title = 'Copy this log into the saved-logs folder';
+      keepBtn.addEventListener('click', () => {
+        keepBtn.disabled = true;
+        keepBtn.textContent = 'Saving…';
+        post({ type: 'keepLog', logId, userId: state.activeUserId });
+        setTimeout(() => {
+          keepBtn.disabled = false;
+          keepBtn.innerHTML = '\u{1F4BE} Keep';
+        }, 2000);
+      });
+      detailHeaderEl.appendChild(keepBtn);
+      const summaryBtn = document.createElement('button');
+      summaryBtn.textContent = 'Generate summary';
+      summaryBtn.title = 'Write a Markdown + Mermaid summary next to this log';
+      summaryBtn.addEventListener('click', () => {
+        summaryBtn.disabled = true;
+        summaryBtn.textContent = 'Generating…';
+        post({ type: 'generateSummary', logId, userId: state.activeUserId });
+      });
+      detailHeaderEl.appendChild(summaryBtn);
+      const openBtn = document.createElement('button');
+      openBtn.textContent = 'Open file';
+      openBtn.title = 'Open the .log file in an editor tab';
+      openBtn.addEventListener('click', () => {
+        post({ type: 'openLogInEditor', logId, userId: state.activeUserId });
+      });
+      detailHeaderEl.appendChild(openBtn);
+    }
   }
 
   function makeStat(label, value) {
@@ -347,11 +449,18 @@
           renderDetailHeader(null);
           renderEntries();
         }
+        // Drop selections for logs no longer present
+        const visible = new Set(state.logs.map(l => l.id));
+        for (const id of Array.from(state.selected)) {
+          if (!visible.has(id)) state.selected.delete(id);
+        }
         renderLogs();
         break;
       case 'logBody':
+        state.external = null;
+        externalBanner.classList.remove('visible');
         state.entries = msg.entries || [];
-        renderDetailHeader(msg.stats, msg.logId);
+        renderDetailHeader(msg.stats, msg.logId, false);
         if (msg.error) {
           detailBodyEl.innerHTML = `<div class="empty">${escapeHtml(msg.error)}</div>`;
         } else {
@@ -364,6 +473,25 @@
       case 'commandTrail':
         state.trail = msg.entries || [];
         renderTrail();
+        break;
+      case 'externalLog':
+        if (msg.loaded) {
+          state.external = { name: msg.name, sourcePath: msg.sourcePath };
+          state.activeLogId = null;
+          state.activeUserId = null;
+          state.entries = msg.entries || [];
+          externalBanner.classList.add('visible');
+          externalPathEl.textContent = msg.sourcePath;
+          renderLogs();
+          renderDetailHeader(msg.stats, msg.name, true);
+          renderEntries();
+        } else {
+          state.external = null;
+          state.entries = [];
+          externalBanner.classList.remove('visible');
+          renderDetailHeader(null);
+          renderEntries();
+        }
         break;
     }
   });

@@ -2,7 +2,7 @@
   "name": "sf-log-reader",
   "displayName": "SF Log Reader",
   "description": "Browse, fetch, and filter Salesforce debug logs from any authenticated org, surfaced in a bottom-panel webview.",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "publisher": "Skrety",
   "license": "MIT",
   "repository": {
@@ -79,6 +79,14 @@
       {
         "command": "sfLogReader.generateSummary",
         "title": "SF Log Reader: Generate Summary For Log"
+      },
+      {
+        "command": "sfLogReader.openLogFile",
+        "title": "SF Log Reader: Open .log File…"
+      },
+      {
+        "command": "sfLogReader.openSavedLogsFolder",
+        "title": "SF Log Reader: Open Saved-Logs Folder"
       }
     ],
     "configuration": {
@@ -91,6 +99,20 @@
           "maximum": 200,
           "description": "Maximum number of recent logs to list/fetch per refresh."
         },
+        "sfLogReader.fetchConcurrency": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "How many log-body downloads to run in parallel. Higher = faster but more pressure on the org's API limits."
+        },
+        "sfLogReader.mermaidMaxEdges": {
+          "type": "number",
+          "default": 500,
+          "minimum": 50,
+          "maximum": 10000,
+          "description": "Injected into the Mermaid call-graph diagram as the maxEdges directive. Raise this if a summary fails to render with 'Edges limit reached'."
+        },
         "sfLogReader.maxStorageMB": {
           "type": "number",
           "default": 200,
@@ -102,6 +124,11 @@
           "type": "string",
           "default": ".sf-logs",
           "description": "Folder (relative to workspace root) where fetched logs and summaries are stored."
+        },
+        "sfLogReader.savedLogsFolder": {
+          "type": "string",
+          "default": "saved-logs",
+          "description": "Folder where 'Keep' copies logs for long-term reference. Accepts a workspace-relative path, an absolute path, or '~' for the home directory. This folder is never touched by the storage cap cleanup."
         },
         "sfLogReader.commandTimeoutMs": {
           "type": "number",

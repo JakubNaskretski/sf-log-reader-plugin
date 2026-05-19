@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs/promises';
+import * as path from 'path';
 import { CommandTrail, CommandTrailEntry } from './commandTrail';
 import { OrgStore } from './orgStore';
 import { ApexLogRecord, OrgInfo, SfCliError, SfCliService, UserRecord } from './sfCliService';
@@ -6,6 +8,7 @@ import { LogStore, StoredLogMeta } from './logStore';
 import { generateNonce, getPanelHtml } from './panelHtml';
 import { parseLogs, summarize } from './logParser';
 import { generateSummary } from './summaryGenerator';
+import { SavedLogsService } from './savedLogs';
 
 type InboundMessage =
   | { type: 'ready' }
@@ -18,6 +21,12 @@ type InboundMessage =
   | { type: 'selectLog'; logId: string; userId: string }
   | { type: 'openLogInEditor'; logId: string; userId: string }
   | { type: 'generateSummary'; logId: string; userId: string }
+  | { type: 'keepLog'; logId: string; userId: string }
+  | { type: 'keepLogs'; logs: Array<{ logId: string; userId: string }> }
+  | { type: 'keepExternalLog' }
+  | { type: 'openExternalLog' }
+  | { type: 'closeExternalLog' }
+  | { type: 'generateExternalSummary' }
   | { type: 'deleteAllLogs' }
   | { type: 'clearCommandTrail' }
   | { type: 'openLogFolder' };
@@ -57,6 +66,8 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   private orgs: OrgInfo[] = [];
   private users: UserRecord[] = [];
   private logsFromOrg: ApexLogRecord[] = [];
+  private externalLog: { sourcePath: string; body: string } | null = null;
+  private readonly savedLogs = new SavedLogsService();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -129,6 +140,7 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     if (!store) return;
     const config = vscode.workspace.getConfiguration('sfLogReader');
     const limit = config.get<number>('fetchLimit', 25);
+    const concurrency = Math.max(1, Math.min(10, config.get<number>('fetchConcurrency', 5)));
     const maxStorageMB = config.get<number>('maxStorageMB', 200);
     const timeoutMs = config.get<number>('commandTimeoutMs', 60_000);
     const orgAlias = org.alias ?? org.username;
@@ -150,26 +162,32 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    const total = filtered.length;
+    let completed = 0;
     let saved = 0;
     let skipped = 0;
     const failures: Array<{ id: string; error: string }> = [];
-    for (let i = 0; i < filtered.length; i++) {
-      const rec = filtered[i];
-      this.postStatus(`Fetching ${i + 1}/${filtered.length}: ${rec.Id}`);
+
+    this.postStatus(`Fetching ${total} log${total === 1 ? '' : 's'} (${concurrency} parallel)…`);
+    await runWithConcurrency(filtered, concurrency, async rec => {
       try {
-        if (await store.exists(orgAlias, rec.LogUserId ?? 'unknown', rec.Id)) {
+        const owner = rec.LogUserId ?? 'unknown';
+        if (await store.exists(orgAlias, owner, rec.Id)) {
           skipped += 1;
-          continue;
+        } else {
+          const body = await this.sf.getLogBody(org.username, rec.Id, timeoutMs);
+          const result = await store.save(orgAlias, rec, body, org.username);
+          if (result.wrote) saved += 1; else skipped += 1;
         }
-        const body = await this.sf.getLogBody(org.username, rec.Id, timeoutMs);
-        const result = await store.save(orgAlias, rec, body, org.username);
-        if (result.wrote) saved += 1; else skipped += 1;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         failures.push({ id: rec.Id, error: message });
         this.output.appendLine(`[fetch] ${rec.Id} failed: ${message}`);
+      } finally {
+        completed += 1;
+        this.postStatus(`Fetching ${completed}/${total} · ${saved} new · ${skipped} skipped${failures.length ? ` · ${failures.length} error${failures.length === 1 ? '' : 's'}` : ''}`);
       }
-    }
+    });
 
     this.postStatus(`Fetched ${saved} new · skipped ${skipped} existing · ${failures.length} error${failures.length === 1 ? '' : 's'}`);
     await this.refreshStoredLogs();
@@ -279,6 +297,25 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       case 'generateSummary':
         await this.generateSummaryFor(message.logId, message.userId);
         return;
+      case 'keepLog':
+        await this.keepLog(message.logId, message.userId);
+        return;
+      case 'keepLogs':
+        await this.keepLogs(message.logs);
+        return;
+      case 'keepExternalLog':
+        await this.keepExternalLog();
+        return;
+      case 'openExternalLog':
+        await this.openExternalLog();
+        return;
+      case 'closeExternalLog':
+        this.externalLog = null;
+        this.post({ type: 'externalLog', loaded: false });
+        return;
+      case 'generateExternalSummary':
+        await this.generateExternalSummary();
+        return;
       case 'deleteAllLogs':
         await this.clearLocalLogs();
         return;
@@ -306,6 +343,191 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'logBody', logId, body, entries, stats });
   }
 
+  async keepLog(logId: string, userId: string): Promise<void> {
+    const org = this.requireOrg(false);
+    const store = this.requireLogStore();
+    if (!org || !store) return;
+    const orgAlias = org.alias ?? org.username;
+    const body = await store.readBody(orgAlias, userId, logId);
+    if (body === undefined) {
+      vscode.window.showWarningMessage('Log not found locally — fetch it first.');
+      return;
+    }
+    const metas = await store.listStored(orgAlias);
+    const meta = metas.find(m => m.Id === logId);
+    if (!meta) {
+      vscode.window.showWarningMessage('Log metadata not found locally.');
+      return;
+    }
+    let summary: string | undefined;
+    if (await store.summaryExists(orgAlias, userId, logId)) {
+      try {
+        summary = await fs.readFile(store.summaryPath(orgAlias, userId, logId), 'utf8');
+      } catch { /* ignore */ }
+    }
+    try {
+      const result = await this.savedLogs.save(this.savedLogsFolderSetting(), { body, meta, summary });
+      this.postStatus(`Saved to ${this.displayPath(result.logPath)}`);
+      this.offerReveal(result.logPath);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[keep] ${message}`);
+      vscode.window.showErrorMessage(`Failed to save log: ${message}`);
+    }
+  }
+
+  async keepLogs(targets: Array<{ logId: string; userId: string }>): Promise<void> {
+    const org = this.requireOrg(false);
+    const store = this.requireLogStore();
+    if (!org || !store || targets.length === 0) return;
+    const orgAlias = org.alias ?? org.username;
+    const folderSetting = this.savedLogsFolderSetting();
+    const metas = await store.listStored(orgAlias);
+    let saved = 0;
+    const failures: string[] = [];
+    let lastPath = '';
+    for (let i = 0; i < targets.length; i++) {
+      const { logId, userId } = targets[i];
+      this.postStatus(`Saving ${i + 1}/${targets.length}: ${logId}`);
+      try {
+        const body = await store.readBody(orgAlias, userId, logId);
+        const meta = metas.find(m => m.Id === logId);
+        if (body === undefined || !meta) {
+          failures.push(logId);
+          continue;
+        }
+        let summary: string | undefined;
+        if (await store.summaryExists(orgAlias, userId, logId)) {
+          try { summary = await fs.readFile(store.summaryPath(orgAlias, userId, logId), 'utf8'); } catch { /* ignore */ }
+        }
+        const result = await this.savedLogs.save(folderSetting, { body, meta, summary });
+        lastPath = result.logPath;
+        saved += 1;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.output.appendLine(`[keep:${logId}] ${message}`);
+        failures.push(logId);
+      }
+    }
+    const msg = `Saved ${saved}/${targets.length}${failures.length ? ` · ${failures.length} failed` : ''}`;
+    this.postStatus(msg);
+    if (lastPath) {
+      const folder = path.dirname(lastPath);
+      void vscode.window.showInformationMessage(msg, 'Reveal folder').then(choice => {
+        if (choice === 'Reveal folder') {
+          void vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(folder));
+        }
+      });
+    }
+  }
+
+  async keepExternalLog(): Promise<void> {
+    if (!this.externalLog) {
+      vscode.window.showWarningMessage('No external log loaded.');
+      return;
+    }
+    const { sourcePath, body } = this.externalLog;
+    let summary: string | undefined;
+    const sibling = sourcePath.replace(/\.[^.]+$/, '') + '.summary.md';
+    try {
+      summary = await fs.readFile(sibling, 'utf8');
+    } catch { /* no sibling summary */ }
+    try {
+      const result = await this.savedLogs.saveExternal(this.savedLogsFolderSetting(), sourcePath, body, summary);
+      this.postStatus(`Saved to ${this.displayPath(result.logPath)}`);
+      this.offerReveal(result.logPath);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[keep:external] ${message}`);
+      vscode.window.showErrorMessage(`Failed to save log: ${message}`);
+    }
+  }
+
+  async openSavedLogsFolder(): Promise<void> {
+    const folder = this.savedLogs.resolveFolder(this.savedLogsFolderSetting());
+    try {
+      await fs.mkdir(folder, { recursive: true });
+    } catch { /* ignore */ }
+    await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(folder));
+  }
+
+  private savedLogsFolderSetting(): string {
+    return vscode.workspace.getConfiguration('sfLogReader').get<string>('savedLogsFolder', 'saved-logs');
+  }
+
+  private displayPath(absolute: string): string {
+    const relative = vscode.workspace.asRelativePath(absolute, false);
+    return relative === absolute ? absolute : relative;
+  }
+
+  private offerReveal(absolute: string): void {
+    void vscode.window.showInformationMessage(`Saved ${path.basename(absolute)}`, 'Reveal').then(choice => {
+      if (choice === 'Reveal') {
+        void vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(absolute));
+      }
+    });
+  }
+
+  async openExternalLog(uri?: vscode.Uri): Promise<void> {
+    let target = uri;
+    if (!target) {
+      const picked = await vscode.window.showOpenDialog({
+        canSelectMany: false,
+        openLabel: 'Open log',
+        filters: { 'Apex log': ['log', 'txt'], 'All files': ['*'] }
+      });
+      if (!picked || picked.length === 0) return;
+      target = picked[0];
+    }
+    try {
+      const body = await fs.readFile(target.fsPath, 'utf8');
+      this.externalLog = { sourcePath: target.fsPath, body };
+      const entries = parseLogs(body);
+      const stats = summarize(entries);
+      this.post({
+        type: 'externalLog',
+        loaded: true,
+        name: path.basename(target.fsPath),
+        sourcePath: target.fsPath,
+        entries,
+        stats
+      });
+      this.postStatus(`Viewing ${vscode.workspace.asRelativePath(target.fsPath)} (${entries.length} entries)`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      vscode.window.showErrorMessage(`Could not read ${target.fsPath}: ${message}`);
+    }
+  }
+
+  async generateExternalSummary(): Promise<void> {
+    if (!this.externalLog) {
+      vscode.window.showWarningMessage('No external log loaded.');
+      return;
+    }
+    const { sourcePath, body } = this.externalLog;
+    const basename = path.basename(sourcePath);
+    const synthMeta: StoredLogMeta = {
+      Id: basename,
+      orgUsername: '(local file)',
+      orgAlias: 'imported',
+      fetchedAt: new Date().toISOString(),
+      LogLength: body.length
+    };
+    try {
+      const markdown = generateSummary(synthMeta, body, { mermaidMaxEdges: this.mermaidMaxEdges() });
+      const target = sourcePath.replace(/\.[^.]+$/, '') + '.summary.md';
+      await fs.writeFile(target, markdown, 'utf8');
+      this.postStatus(`Summary written to ${vscode.workspace.asRelativePath(target)}`);
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(target));
+      await vscode.window.showTextDocument(doc, { preview: false });
+      await vscode.commands.executeCommand('markdown.showPreviewToSide', vscode.Uri.file(target));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[summary:external] ${message}`);
+      vscode.window.showErrorMessage(`Failed to generate summary: ${message}`);
+    }
+  }
+
   async generateSummaryFor(logId: string, userId: string): Promise<void> {
     const org = this.requireOrg(false);
     const store = this.requireLogStore();
@@ -323,7 +545,7 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       return;
     }
     try {
-      const markdown = generateSummary(meta, body);
+      const markdown = generateSummary(meta, body, { mermaidMaxEdges: this.mermaidMaxEdges() });
       const target = await store.writeSummary(orgAlias, userId, logId, markdown);
       this.postStatus(`Summary written to ${vscode.workspace.asRelativePath(target)}`);
       await this.refreshStoredLogs();
@@ -335,6 +557,10 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       this.output.appendLine(`[summary] ${message}`);
       vscode.window.showErrorMessage(`Failed to generate summary: ${message}`);
     }
+  }
+
+  private mermaidMaxEdges(): number {
+    return vscode.workspace.getConfiguration('sfLogReader').get<number>('mermaidMaxEdges', 500);
   }
 
   private async openLogInEditor(logId: string, userId: string): Promise<void> {
@@ -485,4 +711,17 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   private post(message: unknown): void {
     this.view?.webview.postMessage(message);
   }
+}
+
+async function runWithConcurrency<T>(items: T[], concurrency: number, worker: (item: T, index: number) => Promise<void>): Promise<void> {
+  const width = Math.min(concurrency, items.length);
+  let next = 0;
+  const runners = Array.from({ length: width }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      await worker(items[i], i);
+    }
+  });
+  await Promise.all(runners);
 }

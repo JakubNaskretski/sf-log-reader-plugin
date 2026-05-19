@@ -12,6 +12,7 @@ export type LogCategory =
 export interface LogEntry {
   lineNumber: number;
   timestamp: string;
+  timestampNanos: number | null;
   category: LogCategory;
   eventType: string;
   lineRef: string;
@@ -62,9 +63,11 @@ export function parseLogs(raw: string): LogEntry[] {
     const eventType = parts[0] ?? '';
     const lineRef = parts[1] ?? '';
     const message = parts.slice(2).join(' | ');
+    const nanoMatch = timestampField.match(/\((\d+)\)/);
     entries.push({
       lineNumber: i + 1,
       timestamp: timestampField.split(' ')[0],
+      timestampNanos: nanoMatch ? Number(nanoMatch[1]) : null,
       category: CATEGORY_MAP[eventType] ?? 'SYSTEM',
       eventType,
       lineRef,
