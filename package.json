@@ -2,7 +2,7 @@
   "name": "sf-log-reader",
   "displayName": "SF Log Reader",
   "description": "Browse, fetch, and filter Salesforce debug logs from any authenticated org, surfaced in a bottom-panel webview.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "Skrety",
   "license": "MIT",
   "repository": {
@@ -108,10 +108,17 @@
         },
         "sfLogReader.mermaidMaxEdges": {
           "type": "number",
-          "default": 500,
-          "minimum": 50,
-          "maximum": 10000,
-          "description": "Injected into the Mermaid call-graph diagram as the maxEdges directive. Raise this if a summary fails to render with 'Edges limit reached'."
+          "default": 400,
+          "minimum": 20,
+          "maximum": 2000,
+          "description": "Hard cap on edges emitted into the call-graph Mermaid block. Excess edges are dropped lowest-call-count first and a footnote is added. Also injected as the in-diagram maxEdges directive for renderers that honor it."
+        },
+        "sfLogReader.mermaidMaxNodes": {
+          "type": "number",
+          "default": 60,
+          "minimum": 10,
+          "maximum": 500,
+          "description": "Hard cap on nodes (classes/triggers) emitted into the call-graph. Less-active nodes are dropped first."
         },
         "sfLogReader.maxStorageMB": {
           "type": "number",
