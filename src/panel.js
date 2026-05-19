@@ -8,7 +8,12 @@
   const fetchBtn = document.getElementById('fetch-btn');
   const refreshListBtn = document.getElementById('refresh-list');
   const openFolderBtn = document.getElementById('open-folder');
+  const openExternalBtn = document.getElementById('open-external');
   const clearLogsBtn = document.getElementById('clear-logs');
+  const externalBanner = document.getElementById('external-banner');
+  const externalPathEl = document.getElementById('external-path');
+  const externalSummaryBtn = document.getElementById('external-summary');
+  const externalCloseBtn = document.getElementById('external-close');
   const statusEl = document.getElementById('status');
   const logListEl = document.getElementById('log-list');
   const detailHeaderEl = document.getElementById('detail-header');
@@ -31,7 +36,8 @@
     entries: [],
     filters: new Set(['USER_DEBUG', 'SOQL', 'DML', 'EXCEPTION', 'CALLOUT']),
     search: '',
-    trail: []
+    trail: [],
+    external: null
   };
 
   function post(message) { vscode.postMessage(message); }
@@ -62,7 +68,18 @@
   fetchBtn.addEventListener('click', () => post({ type: 'fetchLogs' }));
   refreshListBtn.addEventListener('click', () => post({ type: 'refreshLogs' }));
   openFolderBtn.addEventListener('click', () => post({ type: 'openLogFolder' }));
+  openExternalBtn.addEventListener('click', () => post({ type: 'openExternalLog' }));
   clearLogsBtn.addEventListener('click', () => post({ type: 'deleteAllLogs' }));
+  externalCloseBtn.addEventListener('click', () => post({ type: 'closeExternalLog' }));
+  externalSummaryBtn.addEventListener('click', () => {
+    externalSummaryBtn.disabled = true;
+    externalSummaryBtn.textContent = 'Generating…';
+    post({ type: 'generateExternalSummary' });
+    setTimeout(() => {
+      externalSummaryBtn.disabled = false;
+      externalSummaryBtn.textContent = 'Summary';
+    }, 2000);
+  });
 
   trailHeader.addEventListener('click', e => {
     if (e.target === clearTrailBtn) return;
@@ -126,6 +143,10 @@
       row.addEventListener('click', () => {
         state.activeLogId = log.id;
         state.activeUserId = log.userId;
+        if (state.external) {
+          state.external = null;
+          externalBanner.classList.remove('visible');
+        }
         renderLogs();
         detailBodyEl.innerHTML = '<div class="empty">Loading…</div>';
         post({ type: 'selectLog', logId: log.id, userId: log.userId });
@@ -169,7 +190,7 @@
     }
   }
 
-  function renderDetailHeader(stats, logId) {
+  function renderDetailHeader(stats, logId, isExternal) {
     if (!stats) {
       detailHeaderEl.innerHTML = '<span class="empty">No log selected.</span>';
       return;
@@ -182,22 +203,24 @@
       if (count > 0) wrap.appendChild(makeStat(cat, count));
     }
     detailHeaderEl.appendChild(wrap);
-    const summaryBtn = document.createElement('button');
-    summaryBtn.textContent = 'Generate summary';
-    summaryBtn.title = 'Write a Markdown + Mermaid summary next to this log';
-    summaryBtn.addEventListener('click', () => {
-      summaryBtn.disabled = true;
-      summaryBtn.textContent = 'Generating…';
-      post({ type: 'generateSummary', logId, userId: state.activeUserId });
-    });
-    detailHeaderEl.appendChild(summaryBtn);
-    const openBtn = document.createElement('button');
-    openBtn.textContent = 'Open file';
-    openBtn.title = 'Open the .log file in an editor tab';
-    openBtn.addEventListener('click', () => {
-      post({ type: 'openLogInEditor', logId, userId: state.activeUserId });
-    });
-    detailHeaderEl.appendChild(openBtn);
+    if (!isExternal) {
+      const summaryBtn = document.createElement('button');
+      summaryBtn.textContent = 'Generate summary';
+      summaryBtn.title = 'Write a Markdown + Mermaid summary next to this log';
+      summaryBtn.addEventListener('click', () => {
+        summaryBtn.disabled = true;
+        summaryBtn.textContent = 'Generating…';
+        post({ type: 'generateSummary', logId, userId: state.activeUserId });
+      });
+      detailHeaderEl.appendChild(summaryBtn);
+      const openBtn = document.createElement('button');
+      openBtn.textContent = 'Open file';
+      openBtn.title = 'Open the .log file in an editor tab';
+      openBtn.addEventListener('click', () => {
+        post({ type: 'openLogInEditor', logId, userId: state.activeUserId });
+      });
+      detailHeaderEl.appendChild(openBtn);
+    }
   }
 
   function makeStat(label, value) {
@@ -350,8 +373,10 @@
         renderLogs();
         break;
       case 'logBody':
+        state.external = null;
+        externalBanner.classList.remove('visible');
         state.entries = msg.entries || [];
-        renderDetailHeader(msg.stats, msg.logId);
+        renderDetailHeader(msg.stats, msg.logId, false);
         if (msg.error) {
           detailBodyEl.innerHTML = `<div class="empty">${escapeHtml(msg.error)}</div>`;
         } else {
@@ -364,6 +389,25 @@
       case 'commandTrail':
         state.trail = msg.entries || [];
         renderTrail();
+        break;
+      case 'externalLog':
+        if (msg.loaded) {
+          state.external = { name: msg.name, sourcePath: msg.sourcePath };
+          state.activeLogId = null;
+          state.activeUserId = null;
+          state.entries = msg.entries || [];
+          externalBanner.classList.add('visible');
+          externalPathEl.textContent = msg.sourcePath;
+          renderLogs();
+          renderDetailHeader(msg.stats, msg.name, true);
+          renderEntries();
+        } else {
+          state.external = null;
+          state.entries = [];
+          externalBanner.classList.remove('visible');
+          renderDetailHeader(null);
+          renderEntries();
+        }
         break;
     }
   });

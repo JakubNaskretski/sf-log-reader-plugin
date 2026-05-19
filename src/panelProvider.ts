@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs/promises';
+import * as path from 'path';
 import { CommandTrail, CommandTrailEntry } from './commandTrail';
 import { OrgStore } from './orgStore';
 import { ApexLogRecord, OrgInfo, SfCliError, SfCliService, UserRecord } from './sfCliService';
@@ -18,6 +20,9 @@ type InboundMessage =
   | { type: 'selectLog'; logId: string; userId: string }
   | { type: 'openLogInEditor'; logId: string; userId: string }
   | { type: 'generateSummary'; logId: string; userId: string }
+  | { type: 'openExternalLog' }
+  | { type: 'closeExternalLog' }
+  | { type: 'generateExternalSummary' }
   | { type: 'deleteAllLogs' }
   | { type: 'clearCommandTrail' }
   | { type: 'openLogFolder' };
@@ -57,6 +62,7 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   private orgs: OrgInfo[] = [];
   private users: UserRecord[] = [];
   private logsFromOrg: ApexLogRecord[] = [];
+  private externalLog: { sourcePath: string; body: string } | null = null;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -279,6 +285,16 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       case 'generateSummary':
         await this.generateSummaryFor(message.logId, message.userId);
         return;
+      case 'openExternalLog':
+        await this.openExternalLog();
+        return;
+      case 'closeExternalLog':
+        this.externalLog = null;
+        this.post({ type: 'externalLog', loaded: false });
+        return;
+      case 'generateExternalSummary':
+        await this.generateExternalSummary();
+        return;
       case 'deleteAllLogs':
         await this.clearLocalLogs();
         return;
@@ -304,6 +320,66 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     const entries = parseLogs(body);
     const stats = summarize(entries);
     this.post({ type: 'logBody', logId, body, entries, stats });
+  }
+
+  async openExternalLog(uri?: vscode.Uri): Promise<void> {
+    let target = uri;
+    if (!target) {
+      const picked = await vscode.window.showOpenDialog({
+        canSelectMany: false,
+        openLabel: 'Open log',
+        filters: { 'Apex log': ['log', 'txt'], 'All files': ['*'] }
+      });
+      if (!picked || picked.length === 0) return;
+      target = picked[0];
+    }
+    try {
+      const body = await fs.readFile(target.fsPath, 'utf8');
+      this.externalLog = { sourcePath: target.fsPath, body };
+      const entries = parseLogs(body);
+      const stats = summarize(entries);
+      this.post({
+        type: 'externalLog',
+        loaded: true,
+        name: path.basename(target.fsPath),
+        sourcePath: target.fsPath,
+        entries,
+        stats
+      });
+      this.postStatus(`Viewing ${vscode.workspace.asRelativePath(target.fsPath)} (${entries.length} entries)`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      vscode.window.showErrorMessage(`Could not read ${target.fsPath}: ${message}`);
+    }
+  }
+
+  async generateExternalSummary(): Promise<void> {
+    if (!this.externalLog) {
+      vscode.window.showWarningMessage('No external log loaded.');
+      return;
+    }
+    const { sourcePath, body } = this.externalLog;
+    const basename = path.basename(sourcePath);
+    const synthMeta: StoredLogMeta = {
+      Id: basename,
+      orgUsername: '(local file)',
+      orgAlias: 'imported',
+      fetchedAt: new Date().toISOString(),
+      LogLength: body.length
+    };
+    try {
+      const markdown = generateSummary(synthMeta, body);
+      const target = sourcePath.replace(/\.[^.]+$/, '') + '.summary.md';
+      await fs.writeFile(target, markdown, 'utf8');
+      this.postStatus(`Summary written to ${vscode.workspace.asRelativePath(target)}`);
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(target));
+      await vscode.window.showTextDocument(doc, { preview: false });
+      await vscode.commands.executeCommand('markdown.showPreviewToSide', vscode.Uri.file(target));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[summary:external] ${message}`);
+      vscode.window.showErrorMessage(`Failed to generate summary: ${message}`);
+    }
   }
 
   async generateSummaryFor(logId: string, userId: string): Promise<void> {

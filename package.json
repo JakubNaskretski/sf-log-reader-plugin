@@ -79,6 +79,10 @@
       {
         "command": "sfLogReader.generateSummary",
         "title": "SF Log Reader: Generate Summary For Log"
+      },
+      {
+        "command": "sfLogReader.openLogFile",
+        "title": "SF Log Reader: Open .log File…"
       }
     ],
     "configuration": {
