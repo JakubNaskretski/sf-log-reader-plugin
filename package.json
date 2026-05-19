@@ -1,0 +1,129 @@
+{
+  "name": "sf-log-reader",
+  "displayName": "SF Log Reader",
+  "description": "Browse, fetch, and filter Salesforce debug logs from any authenticated org, surfaced in a bottom-panel webview.",
+  "version": "0.1.0",
+  "publisher": "Skrety",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JakubNaskretski/sf-log-reader-plugin"
+  },
+  "galleryBanner": {
+    "color": "#1e1e2e",
+    "theme": "dark"
+  },
+  "keywords": [
+    "salesforce",
+    "apex",
+    "debug log",
+    "sf",
+    "sfdx",
+    "log viewer"
+  ],
+  "engines": {
+    "vscode": "^1.105.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Debuggers"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "sf-log-reader-panel",
+          "title": "SF Log Reader",
+          "icon": "$(output)"
+        }
+      ]
+    },
+    "views": {
+      "sf-log-reader-panel": [
+        {
+          "type": "webview",
+          "id": "sfLogReader.panelView",
+          "name": "Debug Logs"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "sfLogReader.refresh",
+        "title": "SF Log Reader: Refresh Log List",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "sfLogReader.fetchLatest",
+        "title": "SF Log Reader: Fetch Latest Logs",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "sfLogReader.selectOrg",
+        "title": "SF Log Reader: Select Org"
+      },
+      {
+        "command": "sfLogReader.selectUser",
+        "title": "SF Log Reader: Select Log User"
+      },
+      {
+        "command": "sfLogReader.openLogFolder",
+        "title": "SF Log Reader: Open Local Log Folder"
+      },
+      {
+        "command": "sfLogReader.clearLocalLogs",
+        "title": "SF Log Reader: Clear Local Logs For Current Org"
+      }
+    ],
+    "configuration": {
+      "title": "SF Log Reader",
+      "properties": {
+        "sfLogReader.fetchLimit": {
+          "type": "number",
+          "default": 25,
+          "minimum": 1,
+          "maximum": 200,
+          "description": "Maximum number of recent logs to list/fetch per refresh."
+        },
+        "sfLogReader.maxStorageMB": {
+          "type": "number",
+          "default": 200,
+          "minimum": 10,
+          "maximum": 5000,
+          "description": "Soft cap on total local log storage (per org). When exceeded, a prompt offers to delete oldest logs."
+        },
+        "sfLogReader.logFolderName": {
+          "type": "string",
+          "default": ".sf-logs",
+          "description": "Folder (relative to workspace root) where fetched logs and summaries are stored."
+        },
+        "sfLogReader.commandTimeoutMs": {
+          "type": "number",
+          "default": 60000,
+          "minimum": 5000,
+          "maximum": 600000,
+          "description": "Timeout in milliseconds for individual sf CLI invocations."
+        },
+        "sfLogReader.apiVersion": {
+          "type": "string",
+          "default": "60.0",
+          "description": "Salesforce API version (informational; used for any future Tooling API calls)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./ && node ./scripts/copy-panel-js.mjs",
+    "watch": "tsc -watch -p ./",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "@types/vscode": "^1.105.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.5"
+  }
+}

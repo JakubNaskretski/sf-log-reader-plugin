@@ -1,0 +1,89 @@
+name: Claude Code PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        run: git diff origin/${{ github.base_ref }}...HEAD > pr.diff
+
+      - name: Claude PR Review
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python3 - <<'PYEOF'
+          import json
+
+          with open("pr.diff") as f:
+              diff = f.read()
+
+          if len(diff) > 100_000:
+              diff = diff[:100_000] + "\n... (diff truncated)"
+
+          payload = {
+              "model": "claude-sonnet-4-6",
+              "max_tokens": 4096,
+              "messages": [{
+                  "role": "user",
+                  "content": (
+                      "Review this PR diff for:\n"
+                      "1. Bugs and logic errors (including off-by-one, wrong index/slice boundaries)\n"
+                      "2. Security vulnerabilities (injection, XSS, hardcoded secrets)\n"
+                      "3. Code quality issues\n\n"
+                      "Format issues strictly as: [HIGH], [MEDIUM], or [LOW] followed by file:line and description.\n"
+                      "If no issues found, respond with: No issues found.\n\n"
+                      "Diff:\n" + diff
+                  )
+              }]
+          }
+
+          with open("payload.json", "w") as f:
+              json.dump(payload, f)
+          PYEOF
+
+          RESPONSE=$(curl -sf https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d @payload.json) || { echo "review=Claude API call failed." >> $GITHUB_OUTPUT; exit 0; }
+
+          REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text')
+          [ "$REVIEW" = "null" ] && REVIEW="Claude API returned unexpected response."
+          DELIM=$(uuidgen)
+          echo "review<<$DELIM" >> $GITHUB_OUTPUT
+          echo "$REVIEW" >> $GITHUB_OUTPUT
+          echo "$DELIM" >> $GITHUB_OUTPUT
+
+      - name: Post PR comment and check severity
+        uses: actions/github-script@v7
+        env:
+          REVIEW: ${{ steps.claude.outputs.review }}
+        with:
+          script: |
+            const review = process.env.REVIEW;
+            const hasHigh = review.includes('[HIGH]');
+            const header = hasHigh
+              ? '## Claude Code PR Review\n\n> HIGH severity issues found - fix before merging.\n\n'
+              : '## Claude Code PR Review\n\n> No HIGH severity issues found.\n\n';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: header + review
+            });
+            if (hasHigh) {
+              core.setFailed('Claude found HIGH severity issues in this PR.');
+            }

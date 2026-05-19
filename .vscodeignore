@@ -1,0 +1,14 @@
+.vscode/**
+.vscode-test/**
+src/**
+.gitignore
+.github/**
+tsconfig.json
+**/*.ts
+**/*.map
+node_modules/**
+!node_modules/.bin/
+**/.eslintrc.json
+commitlint.config.js
+CONTRIBUTING.md
+.claude/**
