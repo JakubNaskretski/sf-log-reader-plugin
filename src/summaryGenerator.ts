@@ -36,7 +36,11 @@ interface SoqlSample {
 const TRIGGER_EVENT_RE = /\btrigger event\b/i;
 const CODE_UNIT_TRIGGER_RE = /^([^|]+?)\s+on\s+([^|]+?)\s+trigger event\s+([A-Za-z]+)/i;
 
-export function generateSummary(meta: StoredLogMeta, body: string): string {
+export interface SummaryOptions {
+  mermaidMaxEdges?: number;
+}
+
+export function generateSummary(meta: StoredLogMeta, body: string, options: SummaryOptions = {}): string {
   const entries = parseLogs(body);
   const stats = summarize(entries);
   const { frames, byClass, mermaidEdges } = walk(entries);
@@ -56,7 +60,7 @@ export function generateSummary(meta: StoredLogMeta, body: string): string {
   lines.push('');
   lines.push('## Call graph');
   lines.push('');
-  lines.push(renderMermaid(byClass, mermaidEdges));
+  lines.push(renderMermaid(byClass, mermaidEdges, options.mermaidMaxEdges));
   lines.push('');
   if (topSoql.length > 0) {
     lines.push('## Top SOQL queries');
@@ -260,14 +264,18 @@ function perClassTable(byClass: Map<string, ClassStats>): string {
   return out.join('\n');
 }
 
-function renderMermaid(byClass: Map<string, ClassStats>, edges: Map<string, Set<string>>): string {
+function renderMermaid(byClass: Map<string, ClassStats>, edges: Map<string, Set<string>>, maxEdges?: number): string {
   if (byClass.size === 0) return '_(no frames to diagram)_';
   const ids = new Map<string, string>();
   let counter = 0;
   for (const className of byClass.keys()) {
     ids.set(className, `n${counter++}`);
   }
-  const lines = ['```mermaid', 'flowchart TD'];
+  const lines = ['```mermaid'];
+  if (maxEdges && maxEdges > 0) {
+    lines.push(`%%{init: {"maxEdges": ${maxEdges}}}%%`);
+  }
+  lines.push('flowchart TD');
   for (const stats of byClass.values()) {
     const id = ids.get(stats.className)!;
     const labelLines: string[] = [escapeMermaidLabel(stats.className)];

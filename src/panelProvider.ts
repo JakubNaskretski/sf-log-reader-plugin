@@ -135,6 +135,7 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     if (!store) return;
     const config = vscode.workspace.getConfiguration('sfLogReader');
     const limit = config.get<number>('fetchLimit', 25);
+    const concurrency = Math.max(1, Math.min(10, config.get<number>('fetchConcurrency', 5)));
     const maxStorageMB = config.get<number>('maxStorageMB', 200);
     const timeoutMs = config.get<number>('commandTimeoutMs', 60_000);
     const orgAlias = org.alias ?? org.username;
@@ -156,26 +157,32 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    const total = filtered.length;
+    let completed = 0;
     let saved = 0;
     let skipped = 0;
     const failures: Array<{ id: string; error: string }> = [];
-    for (let i = 0; i < filtered.length; i++) {
-      const rec = filtered[i];
-      this.postStatus(`Fetching ${i + 1}/${filtered.length}: ${rec.Id}`);
+
+    this.postStatus(`Fetching ${total} log${total === 1 ? '' : 's'} (${concurrency} parallel)…`);
+    await runWithConcurrency(filtered, concurrency, async rec => {
       try {
-        if (await store.exists(orgAlias, rec.LogUserId ?? 'unknown', rec.Id)) {
+        const owner = rec.LogUserId ?? 'unknown';
+        if (await store.exists(orgAlias, owner, rec.Id)) {
           skipped += 1;
-          continue;
+        } else {
+          const body = await this.sf.getLogBody(org.username, rec.Id, timeoutMs);
+          const result = await store.save(orgAlias, rec, body, org.username);
+          if (result.wrote) saved += 1; else skipped += 1;
         }
-        const body = await this.sf.getLogBody(org.username, rec.Id, timeoutMs);
-        const result = await store.save(orgAlias, rec, body, org.username);
-        if (result.wrote) saved += 1; else skipped += 1;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         failures.push({ id: rec.Id, error: message });
         this.output.appendLine(`[fetch] ${rec.Id} failed: ${message}`);
+      } finally {
+        completed += 1;
+        this.postStatus(`Fetching ${completed}/${total} · ${saved} new · ${skipped} skipped${failures.length ? ` · ${failures.length} error${failures.length === 1 ? '' : 's'}` : ''}`);
       }
-    }
+    });
 
     this.postStatus(`Fetched ${saved} new · skipped ${skipped} existing · ${failures.length} error${failures.length === 1 ? '' : 's'}`);
     await this.refreshStoredLogs();
@@ -368,7 +375,7 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       LogLength: body.length
     };
     try {
-      const markdown = generateSummary(synthMeta, body);
+      const markdown = generateSummary(synthMeta, body, { mermaidMaxEdges: this.mermaidMaxEdges() });
       const target = sourcePath.replace(/\.[^.]+$/, '') + '.summary.md';
       await fs.writeFile(target, markdown, 'utf8');
       this.postStatus(`Summary written to ${vscode.workspace.asRelativePath(target)}`);
@@ -399,7 +406,7 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       return;
     }
     try {
-      const markdown = generateSummary(meta, body);
+      const markdown = generateSummary(meta, body, { mermaidMaxEdges: this.mermaidMaxEdges() });
       const target = await store.writeSummary(orgAlias, userId, logId, markdown);
       this.postStatus(`Summary written to ${vscode.workspace.asRelativePath(target)}`);
       await this.refreshStoredLogs();
@@ -411,6 +418,10 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       this.output.appendLine(`[summary] ${message}`);
       vscode.window.showErrorMessage(`Failed to generate summary: ${message}`);
     }
+  }
+
+  private mermaidMaxEdges(): number {
+    return vscode.workspace.getConfiguration('sfLogReader').get<number>('mermaidMaxEdges', 500);
   }
 
   private async openLogInEditor(logId: string, userId: string): Promise<void> {
@@ -561,4 +572,17 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   private post(message: unknown): void {
     this.view?.webview.postMessage(message);
   }
+}
+
+async function runWithConcurrency<T>(items: T[], concurrency: number, worker: (item: T, index: number) => Promise<void>): Promise<void> {
+  const width = Math.min(concurrency, items.length);
+  let next = 0;
+  const runners = Array.from({ length: width }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      await worker(items[i], i);
+    }
+  });
+  await Promise.all(runners);
 }
