@@ -17,6 +17,9 @@
   const externalCloseBtn = document.getElementById('external-close');
   const statusEl = document.getElementById('status');
   const logListEl = document.getElementById('log-list');
+  const selectAllEl = document.getElementById('select-all');
+  const selectionCountEl = document.getElementById('selection-count');
+  const keepSelectedBtn = document.getElementById('keep-selected');
   const detailHeaderEl = document.getElementById('detail-header');
   const detailBodyEl = document.getElementById('detail-body');
   const searchEl = document.getElementById('search');
@@ -38,7 +41,8 @@
     filters: new Set(['USER_DEBUG', 'SOQL', 'DML', 'EXCEPTION', 'CALLOUT']),
     search: '',
     trail: [],
-    external: null
+    external: null,
+    selected: new Set()
   };
 
   function post(message) { vscode.postMessage(message); }
@@ -71,6 +75,23 @@
   openFolderBtn.addEventListener('click', () => post({ type: 'openLogFolder' }));
   openExternalBtn.addEventListener('click', () => post({ type: 'openExternalLog' }));
   clearLogsBtn.addEventListener('click', () => post({ type: 'deleteAllLogs' }));
+
+  selectAllEl.addEventListener('change', () => {
+    state.selected = new Set(selectAllEl.checked ? state.logs.map(l => l.id) : []);
+    renderLogs();
+    renderSelection();
+  });
+  keepSelectedBtn.addEventListener('click', () => {
+    const picks = state.logs.filter(l => state.selected.has(l.id)).map(l => ({ logId: l.id, userId: l.userId }));
+    if (picks.length === 0) return;
+    keepSelectedBtn.disabled = true;
+    keepSelectedBtn.textContent = 'Saving…';
+    post({ type: 'keepLogs', logs: picks });
+    setTimeout(() => {
+      keepSelectedBtn.innerHTML = '\u{1F4BE} Keep selected';
+      renderSelection();
+    }, 2000);
+  });
   externalCloseBtn.addEventListener('click', () => post({ type: 'closeExternalLog' }));
   externalKeepBtn.addEventListener('click', () => {
     externalKeepBtn.disabled = true;
@@ -150,6 +171,23 @@
     for (const log of state.logs) {
       const row = document.createElement('div');
       row.className = 'log-row' + (log.id === state.activeLogId ? ' active' : '');
+
+      const check = document.createElement('input');
+      check.type = 'checkbox';
+      check.className = 'row-check';
+      check.checked = state.selected.has(log.id);
+      check.addEventListener('click', e => e.stopPropagation());
+      check.addEventListener('change', () => {
+        if (check.checked) state.selected.add(log.id);
+        else state.selected.delete(log.id);
+        renderSelection();
+      });
+      row.appendChild(check);
+
+      const body = document.createElement('div');
+      body.className = 'row-body';
+      row.appendChild(body);
+
       row.addEventListener('click', () => {
         state.activeLogId = log.id;
         state.activeUserId = log.userId;
@@ -194,9 +232,27 @@
       if (size.textContent) bot.appendChild(size);
       if (dur.textContent) bot.appendChild(dur);
 
-      row.appendChild(top);
-      row.appendChild(bot);
+      body.appendChild(top);
+      body.appendChild(bot);
       logListEl.appendChild(row);
+    }
+    renderSelection();
+  }
+
+  function renderSelection() {
+    const n = state.selected.size;
+    selectionCountEl.textContent = `${n} selected`;
+    keepSelectedBtn.disabled = n === 0;
+    if (keepSelectedBtn.textContent === 'Saving…' && n === 0) {
+      keepSelectedBtn.innerHTML = '\u{1F4BE} Keep selected';
+    }
+    if (state.logs.length > 0) {
+      const allSelected = state.logs.every(l => state.selected.has(l.id));
+      selectAllEl.checked = allSelected;
+      selectAllEl.indeterminate = !allSelected && n > 0;
+    } else {
+      selectAllEl.checked = false;
+      selectAllEl.indeterminate = false;
     }
   }
 
@@ -392,6 +448,11 @@
           state.entries = [];
           renderDetailHeader(null);
           renderEntries();
+        }
+        // Drop selections for logs no longer present
+        const visible = new Set(state.logs.map(l => l.id));
+        for (const id of Array.from(state.selected)) {
+          if (!visible.has(id)) state.selected.delete(id);
         }
         renderLogs();
         break;

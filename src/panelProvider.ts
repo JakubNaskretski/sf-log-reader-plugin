@@ -22,6 +22,7 @@ type InboundMessage =
   | { type: 'openLogInEditor'; logId: string; userId: string }
   | { type: 'generateSummary'; logId: string; userId: string }
   | { type: 'keepLog'; logId: string; userId: string }
+  | { type: 'keepLogs'; logs: Array<{ logId: string; userId: string }> }
   | { type: 'keepExternalLog' }
   | { type: 'openExternalLog' }
   | { type: 'closeExternalLog' }
@@ -299,6 +300,9 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       case 'keepLog':
         await this.keepLog(message.logId, message.userId);
         return;
+      case 'keepLogs':
+        await this.keepLogs(message.logs);
+        return;
       case 'keepExternalLog':
         await this.keepExternalLog();
         return;
@@ -369,6 +373,51 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       const message = err instanceof Error ? err.message : String(err);
       this.output.appendLine(`[keep] ${message}`);
       vscode.window.showErrorMessage(`Failed to save log: ${message}`);
+    }
+  }
+
+  async keepLogs(targets: Array<{ logId: string; userId: string }>): Promise<void> {
+    const org = this.requireOrg(false);
+    const store = this.requireLogStore();
+    if (!org || !store || targets.length === 0) return;
+    const orgAlias = org.alias ?? org.username;
+    const folderSetting = this.savedLogsFolderSetting();
+    const metas = await store.listStored(orgAlias);
+    let saved = 0;
+    const failures: string[] = [];
+    let lastPath = '';
+    for (let i = 0; i < targets.length; i++) {
+      const { logId, userId } = targets[i];
+      this.postStatus(`Saving ${i + 1}/${targets.length}: ${logId}`);
+      try {
+        const body = await store.readBody(orgAlias, userId, logId);
+        const meta = metas.find(m => m.Id === logId);
+        if (body === undefined || !meta) {
+          failures.push(logId);
+          continue;
+        }
+        let summary: string | undefined;
+        if (await store.summaryExists(orgAlias, userId, logId)) {
+          try { summary = await fs.readFile(store.summaryPath(orgAlias, userId, logId), 'utf8'); } catch { /* ignore */ }
+        }
+        const result = await this.savedLogs.save(folderSetting, { body, meta, summary });
+        lastPath = result.logPath;
+        saved += 1;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.output.appendLine(`[keep:${logId}] ${message}`);
+        failures.push(logId);
+      }
+    }
+    const msg = `Saved ${saved}/${targets.length}${failures.length ? ` · ${failures.length} failed` : ''}`;
+    this.postStatus(msg);
+    if (lastPath) {
+      const folder = path.dirname(lastPath);
+      void vscode.window.showInformationMessage(msg, 'Reveal folder').then(choice => {
+        if (choice === 'Reveal folder') {
+          void vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(folder));
+        }
+      });
     }
   }
 

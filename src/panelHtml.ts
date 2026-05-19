@@ -104,9 +104,37 @@ export function getPanelHtml(webview: vscode.Webview, extensionUri: vscode.Uri, 
     .log-list {
       flex: 0 0 38%;
       max-width: 38%;
-      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
       border-right: 1px solid var(--vscode-panel-border);
       font-size: 12px;
+      min-height: 0;
+    }
+    .log-list-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      border-bottom: 1px solid var(--vscode-panel-border);
+      font-size: 11px;
+      flex-shrink: 0;
+      background: var(--vscode-panel-background);
+    }
+    .log-list-header input[type="checkbox"] { margin: 0; cursor: pointer; }
+    .log-list-header .count { color: var(--vscode-descriptionForeground); }
+    .log-list-header button {
+      margin-left: auto;
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: 1px solid var(--vscode-button-border, transparent);
+      padding: 2px 8px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .log-list-header button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .log-list-body {
+      flex: 1;
+      overflow-y: auto;
     }
     .log-list .empty {
       padding: 12px;
@@ -117,7 +145,12 @@ export function getPanelHtml(webview: vscode.Webview, extensionUri: vscode.Uri, 
       padding: 6px 8px;
       border-bottom: 1px solid var(--vscode-panel-border);
       cursor: pointer;
+      display: flex;
+      gap: 6px;
+      align-items: flex-start;
     }
+    .log-row .row-check { margin-top: 2px; cursor: pointer; }
+    .log-row .row-body { flex: 1; min-width: 0; }
     .log-row:hover { background: var(--vscode-list-hoverBackground); }
     .log-row.active {
       background: var(--vscode-list-activeSelectionBackground);
@@ -316,8 +349,15 @@ export function getPanelHtml(webview: vscode.Webview, extensionUri: vscode.Uri, 
     <input type="text" id="search" placeholder="Search log text…" />
   </div>
   <div class="main">
-    <div class="log-list" id="log-list">
-      <div class="empty">No logs yet — pick an org and Fetch.</div>
+    <div class="log-list">
+      <div class="log-list-header">
+        <input type="checkbox" id="select-all" title="Select all visible" />
+        <span class="count" id="selection-count">0 selected</span>
+        <button id="keep-selected" disabled title="Copy selected logs into the saved-logs folder">&#x1f4be; Keep selected</button>
+      </div>
+      <div class="log-list-body" id="log-list">
+        <div class="empty">No logs yet — pick an org and Fetch.</div>
+      </div>
     </div>
     <div class="log-detail">
       <div class="external-banner" id="external-banner">

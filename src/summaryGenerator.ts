@@ -7,7 +7,8 @@ interface Frame {
   className: string;
   detail: string;
   enteredAt: string;
-  exitedAt?: string;
+  enteredNanos: number | null;
+  exitedNanos: number | null;
   soql: number;
   dml: number;
   callouts: number;
@@ -22,15 +23,35 @@ interface ClassStats {
   callouts: number;
   exceptions: number;
   enters: number;
+  totalNanos: number;
   isTrigger: boolean;
   detail: string;
 }
 
-interface SoqlSample {
-  line: string;
+interface SoqlTiming {
+  lineRef: string;
   query: string;
+  rows?: number;
   aggregations?: string;
-  rows?: string;
+  durationMs?: number;
+}
+
+interface DmlOp {
+  op: string;
+  type: string;
+  count: number;
+  rows: number;
+}
+
+interface MethodCount {
+  signature: string;
+  enters: number;
+}
+
+interface LimitMetric {
+  name: string;
+  used: number;
+  max: number;
 }
 
 const TRIGGER_EVENT_RE = /\btrigger event\b/i;
@@ -43,33 +64,49 @@ export interface SummaryOptions {
 export function generateSummary(meta: StoredLogMeta, body: string, options: SummaryOptions = {}): string {
   const entries = parseLogs(body);
   const stats = summarize(entries);
-  const { frames, byClass, mermaidEdges } = walk(entries);
-  const topSoql = collectSoqlSamples(entries, 10);
+  const { frames, byClass, edgeCalls } = walk(entries);
+  const soqlTimings = collectSoqlTimings(entries);
+  const dmlBreakdown = collectDmlBreakdown(entries);
+  const hottestMethods = collectHottestMethods(entries, 15);
+  const limits = parseLimits(body);
   const exceptions = entries.filter(e => e.category === 'EXCEPTION');
+  const totalElapsedMs = computeTotalElapsedMs(entries);
 
   const lines: string[] = [];
   lines.push(`# Log Summary — \`${meta.Id}\``);
   lines.push('');
-  lines.push(metadataBlock(meta, body));
+  lines.push(metadataBlock(meta, body, totalElapsedMs));
   lines.push('');
   lines.push('## Event counts');
-  lines.push(eventCountsTable(stats.byCategory));
+  lines.push(eventCountsTable(stats.byCategory, stats.total));
   lines.push('');
+  if (limits.length > 0) {
+    lines.push('## Governor limits (last reported)');
+    lines.push(limitsTable(limits));
+    lines.push('');
+  }
   lines.push('## Per-class breakdown');
   lines.push(perClassTable(byClass));
   lines.push('');
-  lines.push('## Call graph');
-  lines.push('');
-  lines.push(renderMermaid(byClass, mermaidEdges, options.mermaidMaxEdges));
-  lines.push('');
-  if (topSoql.length > 0) {
-    lines.push('## Top SOQL queries');
-    for (const sample of topSoql) {
-      const meta = [sample.line, sample.aggregations, sample.rows].filter(Boolean).join(' · ');
-      lines.push(`- ${meta ? `\`${meta}\` — ` : ''}\`${truncate(sample.query, 200)}\``);
-    }
+  if (dmlBreakdown.length > 0) {
+    lines.push('## DML breakdown');
+    lines.push(dmlBreakdownTable(dmlBreakdown));
     lines.push('');
   }
+  if (soqlTimings.length > 0) {
+    lines.push('## Slowest SOQL queries');
+    lines.push(soqlTimingTable(soqlTimings.slice(0, 10)));
+    lines.push('');
+  }
+  if (hottestMethods.length > 0) {
+    lines.push('## Hottest methods (by entry count)');
+    lines.push(hottestMethodsTable(hottestMethods));
+    lines.push('');
+  }
+  lines.push('## Call graph');
+  lines.push('');
+  lines.push(renderMermaid(byClass, edgeCalls, options.mermaidMaxEdges));
+  lines.push('');
   if (exceptions.length > 0) {
     lines.push('## Exceptions');
     for (const e of exceptions) {
@@ -88,18 +125,18 @@ export function generateSummary(meta: StoredLogMeta, body: string, options: Summ
 function walk(entries: LogEntry[]): {
   frames: Frame[];
   byClass: Map<string, ClassStats>;
-  mermaidEdges: Map<string, Set<string>>;
+  edgeCalls: Map<string, Map<string, number>>;
 } {
   const frames: Frame[] = [];
   const stack: number[] = [];
   const byClass = new Map<string, ClassStats>();
-  const edges = new Map<string, Set<string>>();
+  const edgeCalls = new Map<string, Map<string, number>>();
   let nextId = 0;
 
   const ensureClassStats = (className: string, isTrigger: boolean, detail: string): ClassStats => {
     let s = byClass.get(className);
     if (!s) {
-      s = { className, soql: 0, dml: 0, callouts: 0, exceptions: 0, enters: 0, isTrigger, detail };
+      s = { className, soql: 0, dml: 0, callouts: 0, exceptions: 0, enters: 0, totalNanos: 0, isTrigger, detail };
       byClass.set(className, s);
     } else {
       if (isTrigger) s.isTrigger = true;
@@ -110,24 +147,25 @@ function walk(entries: LogEntry[]): {
 
   const recordEdge = (parentId: number, childClass: string) => {
     const parent = frames[parentId];
-    if (!parent) return;
-    if (parent.className === childClass) return;
-    let set = edges.get(parent.className);
-    if (!set) {
-      set = new Set();
-      edges.set(parent.className, set);
+    if (!parent || parent.className === childClass) return;
+    let map = edgeCalls.get(parent.className);
+    if (!map) {
+      map = new Map();
+      edgeCalls.set(parent.className, map);
     }
-    set.add(childClass);
+    map.set(childClass, (map.get(childClass) ?? 0) + 1);
   };
 
-  const push = (className: string, detail: string, enteredAt: string, isTrigger: boolean) => {
+  const push = (className: string, detail: string, entry: LogEntry, isTrigger: boolean) => {
     const parent = stack.length > 0 ? stack[stack.length - 1] : null;
     const frame: Frame = {
       id: nextId++,
       parent,
       className,
       detail,
-      enteredAt,
+      enteredAt: entry.timestamp,
+      enteredNanos: entry.timestampNanos,
+      exitedNanos: null,
       soql: 0,
       dml: 0,
       callouts: 0,
@@ -141,10 +179,18 @@ function walk(entries: LogEntry[]): {
     if (parent != null) recordEdge(parent, className);
   };
 
-  const pop = (exitedAt: string) => {
+  const pop = (entry: LogEntry) => {
     const id = stack.pop();
     if (id == null) return;
-    frames[id].exitedAt = exitedAt;
+    const frame = frames[id];
+    frame.exitedNanos = entry.timestampNanos;
+    if (frame.enteredNanos != null && frame.exitedNanos != null) {
+      const dur = frame.exitedNanos - frame.enteredNanos;
+      if (dur > 0) {
+        const stats = byClass.get(frame.className);
+        if (stats) stats.totalNanos += dur;
+      }
+    }
   };
 
   const top = (): Frame | undefined => (stack.length > 0 ? frames[stack[stack.length - 1]] : undefined);
@@ -160,19 +206,19 @@ function walk(entries: LogEntry[]): {
     switch (e.eventType) {
       case 'CODE_UNIT_STARTED': {
         const parsed = parseCodeUnit(e);
-        push(parsed.className, parsed.detail, e.timestamp, parsed.isTrigger);
+        push(parsed.className, parsed.detail, e, parsed.isTrigger);
         break;
       }
       case 'CODE_UNIT_FINISHED':
-        pop(e.timestamp);
+        pop(e);
         break;
       case 'METHOD_ENTRY': {
         const parsed = parseMethod(e);
-        push(parsed.className, parsed.detail, e.timestamp, false);
+        push(parsed.className, parsed.detail, e, false);
         break;
       }
       case 'METHOD_EXIT':
-        pop(e.timestamp);
+        pop(e);
         break;
       case 'SOQL_EXECUTE_BEGIN':
         attribute((s, f) => { s.soql += 1; f.soql += 1; });
@@ -190,7 +236,7 @@ function walk(entries: LogEntry[]): {
     }
   }
 
-  return { frames, byClass, mermaidEdges: edges };
+  return { frames, byClass, edgeCalls };
 }
 
 function parseCodeUnit(entry: LogEntry): { className: string; detail: string; isTrigger: boolean } {
@@ -198,16 +244,12 @@ function parseCodeUnit(entry: LogEntry): { className: string; detail: string; is
   const candidate = parts[parts.length - 1] ?? '';
   if (TRIGGER_EVENT_RE.test(candidate)) {
     const m = candidate.match(CODE_UNIT_TRIGGER_RE);
-    if (m) {
-      return { className: m[1].trim(), detail: `${m[3]} on ${m[2].trim()}`, isTrigger: true };
-    }
+    if (m) return { className: m[1].trim(), detail: `${m[3]} on ${m[2].trim()}`, isTrigger: true };
     const first = candidate.split(/\s+/)[0] ?? candidate;
     return { className: first, detail: candidate, isTrigger: true };
   }
   const dot = candidate.indexOf('.');
-  if (dot > 0) {
-    return { className: candidate.slice(0, dot), detail: candidate.slice(dot + 1), isTrigger: false };
-  }
+  if (dot > 0) return { className: candidate.slice(0, dot), detail: candidate.slice(dot + 1), isTrigger: false };
   return { className: candidate || '(anonymous)', detail: '', isTrigger: false };
 }
 
@@ -217,20 +259,124 @@ function parseMethod(entry: LogEntry): { className: string; detail: string } {
   const parenIdx = candidate.indexOf('(');
   const signature = parenIdx >= 0 ? candidate.slice(0, parenIdx) : candidate;
   const dot = signature.lastIndexOf('.');
-  if (dot > 0) {
-    return { className: signature.slice(0, dot), detail: signature.slice(dot + 1) };
-  }
+  if (dot > 0) return { className: signature.slice(0, dot), detail: signature.slice(dot + 1) };
   return { className: signature || '(anonymous)', detail: '' };
 }
 
-function metadataBlock(meta: StoredLogMeta, body: string): string {
+function collectSoqlTimings(entries: LogEntry[]): SoqlTiming[] {
+  const stack: Array<{ index: number; entry: LogEntry; query: string; aggregations?: string }> = [];
+  const out: SoqlTiming[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    if (e.eventType === 'SOQL_EXECUTE_BEGIN') {
+      const segments = e.message.split(' | ').map(s => s.trim()).filter(Boolean);
+      let aggregations: string | undefined;
+      let query = segments[segments.length - 1] ?? '';
+      if (segments[0] && /^Aggregations:/i.test(segments[0])) {
+        aggregations = segments[0];
+        if (segments.length > 1) query = segments[segments.length - 1];
+      }
+      stack.push({ index: i, entry: e, query, aggregations });
+    } else if (e.eventType === 'SOQL_EXECUTE_END') {
+      const open = stack.pop();
+      if (!open) continue;
+      const segments = e.message.split(' | ').map(s => s.trim()).filter(Boolean);
+      const rowsField = segments.find(s => /^Rows:/i.test(s));
+      const rows = rowsField ? Number(rowsField.replace(/^Rows:/i, '')) : undefined;
+      const durationMs =
+        open.entry.timestampNanos != null && e.timestampNanos != null
+          ? Math.max(0, (e.timestampNanos - open.entry.timestampNanos) / 1_000_000)
+          : undefined;
+      out.push({
+        lineRef: open.entry.lineRef,
+        query: open.query,
+        aggregations: open.aggregations,
+        rows: Number.isFinite(rows) ? rows : undefined,
+        durationMs
+      });
+    }
+  }
+  return out.sort((a, b) => (b.durationMs ?? 0) - (a.durationMs ?? 0));
+}
+
+function collectDmlBreakdown(entries: LogEntry[]): DmlOp[] {
+  const bucket = new Map<string, DmlOp>();
+  for (const e of entries) {
+    if (e.eventType !== 'DML_BEGIN') continue;
+    const segments = e.message.split(' | ').map(s => s.trim());
+    const op = (segments.find(s => /^Op:/i.test(s)) ?? 'Op:Unknown').replace(/^Op:/i, '');
+    const type = (segments.find(s => /^Type:/i.test(s)) ?? 'Type:?').replace(/^Type:/i, '');
+    const rowsField = segments.find(s => /^Rows:/i.test(s));
+    const rows = rowsField ? Number(rowsField.replace(/^Rows:/i, '')) : 0;
+    const key = `${op} ${type}`;
+    const cur = bucket.get(key) ?? { op, type, count: 0, rows: 0 };
+    cur.count += 1;
+    cur.rows += Number.isFinite(rows) ? rows : 0;
+    bucket.set(key, cur);
+  }
+  return Array.from(bucket.values()).sort((a, b) => b.rows - a.rows || b.count - a.count);
+}
+
+function collectHottestMethods(entries: LogEntry[], limit: number): MethodCount[] {
+  const counts = new Map<string, number>();
+  for (const e of entries) {
+    if (e.eventType !== 'METHOD_ENTRY') continue;
+    const segs = e.message.split(' | ').map(s => s.trim()).filter(Boolean);
+    const candidate = segs[segs.length - 1] ?? '';
+    const sig = candidate.replace(/\(.*$/, '').trim();
+    if (!sig) continue;
+    counts.set(sig, (counts.get(sig) ?? 0) + 1);
+  }
+  return Array.from(counts.entries())
+    .map(([signature, enters]) => ({ signature, enters }))
+    .sort((a, b) => b.enters - a.enters)
+    .slice(0, limit);
+}
+
+function parseLimits(raw: string): LimitMetric[] {
+  if (!raw) return [];
+  const lines = raw.split('\n');
+  let inBlock = false;
+  const latest = new Map<string, LimitMetric>();
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\r$/, '');
+    if (line.includes('|LIMIT_USAGE_FOR_NS|') || /^LIMIT_USAGE_FOR_NS\|/.test(line.trim())) {
+      inBlock = true;
+      continue;
+    }
+    if (!inBlock) continue;
+    const trimmed = line.trim();
+    if (!trimmed) { inBlock = false; continue; }
+    if (/^\d{2}:\d{2}:\d{2}/.test(trimmed)) { inBlock = false; continue; }
+    const m = trimmed.match(/^(.+?):\s*(\d+)\s+out of\s+(\d+)/i);
+    if (m) {
+      const name = m[1].replace(/^Number of\s+/i, '').trim();
+      latest.set(name, { name, used: Number(m[2]), max: Number(m[3]) });
+    }
+  }
+  return Array.from(latest.values()).sort((a, b) => percent(b) - percent(a));
+}
+
+function percent(m: LimitMetric): number {
+  return m.max > 0 ? m.used / m.max : 0;
+}
+
+function computeTotalElapsedMs(entries: LogEntry[]): number | undefined {
+  const first = entries.find(e => e.timestampNanos != null);
+  const last = [...entries].reverse().find(e => e.timestampNanos != null);
+  if (!first || !last || first === last) return undefined;
+  return Math.max(0, ((last.timestampNanos ?? 0) - (first.timestampNanos ?? 0)) / 1_000_000);
+}
+
+function metadataBlock(meta: StoredLogMeta, body: string, totalElapsedMs: number | undefined): string {
   const rows: Array<[string, string]> = [
     ['Org', `\`${meta.orgAlias ?? meta.orgUsername}\``],
     ['User', `${meta.LogUserName ?? '?'} (\`${meta.LogUserId ?? '?'}\`)`],
     ['Operation', meta.Operation ?? '—'],
     ['Application', meta.Application ?? '—'],
     ['Status', meta.Status ?? '—'],
-    ['Duration', meta.DurationMilliseconds != null ? `${meta.DurationMilliseconds} ms` : '—'],
+    ['Reported duration', meta.DurationMilliseconds != null ? `${meta.DurationMilliseconds} ms` : '—'],
+    ['Elapsed (from log)', totalElapsedMs != null ? `${totalElapsedMs.toFixed(1)} ms` : '—'],
     ['Log size', meta.LogLength != null ? formatBytes(meta.LogLength) : `${body.length} bytes (local)`],
     ['Started at', meta.StartTime ?? '—'],
     ['Fetched at', meta.fetchedAt]
@@ -240,14 +386,34 @@ function metadataBlock(meta: StoredLogMeta, body: string): string {
   return out.join('\n');
 }
 
-function eventCountsTable(byCategory: Record<LogCategory, number>): string {
+function eventCountsTable(byCategory: Record<LogCategory, number>, total: number): string {
   const rows = (Object.entries(byCategory) as Array<[LogCategory, number]>)
     .filter(([, count]) => count > 0)
     .sort((a, b) => b[1] - a[1]);
   if (rows.length === 0) return '_No entries parsed._';
-  const out = ['| Category | Count |', '| --- | ---: |'];
-  for (const [cat, count] of rows) out.push(`| ${cat} | ${count} |`);
+  const out = ['| Category | Count | Share |', '| --- | ---: | ---: |'];
+  for (const [cat, count] of rows) {
+    const pct = total > 0 ? ((count / total) * 100).toFixed(1) : '0.0';
+    out.push(`| ${cat} | ${count} | ${pct}% |`);
+  }
   return out.join('\n');
+}
+
+function limitsTable(limits: LimitMetric[]): string {
+  const out = ['| Metric | Used | Limit | Headroom | Usage |', '| --- | ---: | ---: | ---: | --- |'];
+  for (const m of limits) {
+    const pct = m.max > 0 ? (m.used / m.max) * 100 : 0;
+    const bar = pctBar(pct);
+    const headroom = m.max - m.used;
+    out.push(`| ${escapeMd(m.name)} | ${m.used} | ${m.max} | ${headroom} | ${bar} ${pct.toFixed(1)}% |`);
+  }
+  return out.join('\n');
+}
+
+function pctBar(pct: number): string {
+  const slots = 10;
+  const filled = Math.min(slots, Math.round((pct / 100) * slots));
+  return '█'.repeat(filled) + '░'.repeat(slots - filled);
 }
 
 function perClassTable(byClass: Map<string, ClassStats>): string {
@@ -256,15 +422,40 @@ function perClassTable(byClass: Map<string, ClassStats>): string {
     const total = (s: ClassStats) => s.soql + s.dml + s.callouts + s.exceptions;
     return total(b) - total(a) || a.className.localeCompare(b.className);
   });
-  const out = ['| Class | Kind | Enters | SOQL | DML | Callouts | Exceptions |',
-    '| --- | --- | ---: | ---: | ---: | ---: | ---: |'];
+  const out = ['| Class | Kind | Enters | SOQL | DML | Callouts | Exceptions | Time (ms) |',
+    '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |'];
   for (const s of rows) {
-    out.push(`| ${escapeMd(s.className)} | ${s.isTrigger ? 'trigger' : 'class'} | ${s.enters} | ${s.soql} | ${s.dml} | ${s.callouts} | ${s.exceptions} |`);
+    const time = s.totalNanos > 0 ? (s.totalNanos / 1_000_000).toFixed(1) : '—';
+    out.push(`| ${escapeMd(s.className)} | ${s.isTrigger ? 'trigger' : 'class'} | ${s.enters} | ${s.soql} | ${s.dml} | ${s.callouts} | ${s.exceptions} | ${time} |`);
   }
   return out.join('\n');
 }
 
-function renderMermaid(byClass: Map<string, ClassStats>, edges: Map<string, Set<string>>, maxEdges?: number): string {
+function dmlBreakdownTable(rows: DmlOp[]): string {
+  const out = ['| Op | Type | Statements | Rows |', '| --- | --- | ---: | ---: |'];
+  for (const r of rows) {
+    out.push(`| ${escapeMd(r.op)} | ${escapeMd(r.type)} | ${r.count} | ${r.rows} |`);
+  }
+  return out.join('\n');
+}
+
+function soqlTimingTable(rows: SoqlTiming[]): string {
+  const out = ['| # | Line | Rows | Duration | Query |', '| ---: | --- | ---: | ---: | --- |'];
+  rows.forEach((r, i) => {
+    const dur = r.durationMs != null ? `${r.durationMs.toFixed(1)} ms` : '—';
+    const rows = r.rows != null ? String(r.rows) : '—';
+    out.push(`| ${i + 1} | \`${escapeMd(r.lineRef)}\` | ${rows} | ${dur} | \`${escapeMd(truncate(r.query, 160))}\` |`);
+  });
+  return out.join('\n');
+}
+
+function hottestMethodsTable(methods: MethodCount[]): string {
+  const out = ['| Method | Calls |', '| --- | ---: |'];
+  for (const m of methods) out.push(`| \`${escapeMd(m.signature)}\` | ${m.enters} |`);
+  return out.join('\n');
+}
+
+function renderMermaid(byClass: Map<string, ClassStats>, edgeCalls: Map<string, Map<string, number>>, maxEdges?: number): string {
   if (byClass.size === 0) return '_(no frames to diagram)_';
   const ids = new Map<string, string>();
   let counter = 0;
@@ -272,9 +463,7 @@ function renderMermaid(byClass: Map<string, ClassStats>, edges: Map<string, Set<
     ids.set(className, `n${counter++}`);
   }
   const lines = ['```mermaid'];
-  if (maxEdges && maxEdges > 0) {
-    lines.push(`%%{init: {"maxEdges": ${maxEdges}}}%%`);
-  }
+  if (maxEdges && maxEdges > 0) lines.push(`%%{init: {"maxEdges": ${maxEdges}}}%%`);
   lines.push('flowchart TD');
   for (const stats of byClass.values()) {
     const id = ids.get(stats.className)!;
@@ -286,40 +475,25 @@ function renderMermaid(byClass: Map<string, ClassStats>, edges: Map<string, Set<
       stats.exceptions ? `EXC:${stats.exceptions}` : ''
     ].filter(Boolean).join(' ');
     if (counts) labelLines.push(counts);
+    if (stats.totalNanos > 0) labelLines.push(`${(stats.totalNanos / 1_000_000).toFixed(0)} ms`);
     if (stats.isTrigger && stats.detail) labelLines.push(`(${escapeMermaidLabel(stats.detail)})`);
     const shape = stats.isTrigger ? `${id}{{"${labelLines.join('<br/>')}"}}` : `${id}["${labelLines.join('<br/>')}"]`;
     lines.push(`  ${shape}`);
     if (stats.exceptions > 0) lines.push(`  class ${id} hasExc;`);
   }
-  for (const [from, tos] of edges.entries()) {
+  for (const [from, tos] of edgeCalls.entries()) {
     const fromId = ids.get(from);
     if (!fromId) continue;
-    for (const to of tos) {
+    for (const [to, count] of tos.entries()) {
       const toId = ids.get(to);
       if (!toId) continue;
-      lines.push(`  ${fromId} --> ${toId}`);
+      const label = count > 1 ? `|x${count}|` : '';
+      lines.push(`  ${fromId} -->${label} ${toId}`);
     }
   }
   lines.push('  classDef hasExc fill:#f85149,stroke:#7a1d24,color:#fff;');
   lines.push('```');
   return lines.join('\n');
-}
-
-function collectSoqlSamples(entries: LogEntry[], limit: number): SoqlSample[] {
-  const out: SoqlSample[] = [];
-  for (const e of entries) {
-    if (e.eventType !== 'SOQL_EXECUTE_BEGIN') continue;
-    const segments = e.message.split(' | ').map(s => s.trim());
-    let aggregations: string | undefined;
-    let query = segments[segments.length - 1] ?? '';
-    if (segments[0] && /^Aggregations:/i.test(segments[0])) {
-      aggregations = segments[0];
-      if (segments.length > 1) query = segments[segments.length - 1];
-    }
-    out.push({ line: e.lineRef, query, aggregations });
-    if (out.length >= limit) break;
-  }
-  return out;
 }
 
 function topLevelList(frames: Frame[]): string {
@@ -333,8 +507,11 @@ function topLevelList(frames: Frame[]): string {
         f.callouts ? `${f.callouts} callouts` : '',
         f.exceptions.length ? `${f.exceptions.length} exceptions` : ''
       ].filter(Boolean).join(', ');
+      const elapsed = f.enteredNanos != null && f.exitedNanos != null && f.exitedNanos > f.enteredNanos
+        ? ` — ${((f.exitedNanos - f.enteredNanos) / 1_000_000).toFixed(1)} ms`
+        : '';
       const tag = f.isTrigger ? 'trigger' : 'class';
-      return `${i + 1}. **${escapeMd(f.className)}** _(${tag}${f.detail ? `, ${escapeMd(f.detail)}` : ''})_${counts ? ` — ${counts}` : ''}`;
+      return `${i + 1}. **${escapeMd(f.className)}** _(${tag}${f.detail ? `, ${escapeMd(f.detail)}` : ''})_${counts ? ` — ${counts}` : ''}${elapsed}`;
     })
     .join('\n');
 }
