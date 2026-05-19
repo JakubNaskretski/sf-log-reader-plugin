@@ -323,6 +323,7 @@ export function getPanelHtml(webview: vscode.Webview, extensionUri: vscode.Uri, 
       <div class="external-banner" id="external-banner">
         <span>Viewing external log:</span>
         <span class="path" id="external-path"></span>
+        <button id="external-keep" title="Copy this log into the saved-logs folder">&#x1f4be; Keep</button>
         <button id="external-summary" title="Generate a .summary.md next to the source file">Summary</button>
         <button id="external-close" title="Close external view">&times;</button>
       </div>

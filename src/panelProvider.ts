@@ -8,6 +8,7 @@ import { LogStore, StoredLogMeta } from './logStore';
 import { generateNonce, getPanelHtml } from './panelHtml';
 import { parseLogs, summarize } from './logParser';
 import { generateSummary } from './summaryGenerator';
+import { SavedLogsService } from './savedLogs';
 
 type InboundMessage =
   | { type: 'ready' }
@@ -20,6 +21,8 @@ type InboundMessage =
   | { type: 'selectLog'; logId: string; userId: string }
   | { type: 'openLogInEditor'; logId: string; userId: string }
   | { type: 'generateSummary'; logId: string; userId: string }
+  | { type: 'keepLog'; logId: string; userId: string }
+  | { type: 'keepExternalLog' }
   | { type: 'openExternalLog' }
   | { type: 'closeExternalLog' }
   | { type: 'generateExternalSummary' }
@@ -63,6 +66,7 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   private users: UserRecord[] = [];
   private logsFromOrg: ApexLogRecord[] = [];
   private externalLog: { sourcePath: string; body: string } | null = null;
+  private readonly savedLogs = new SavedLogsService();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -292,6 +296,12 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       case 'generateSummary':
         await this.generateSummaryFor(message.logId, message.userId);
         return;
+      case 'keepLog':
+        await this.keepLog(message.logId, message.userId);
+        return;
+      case 'keepExternalLog':
+        await this.keepExternalLog();
+        return;
       case 'openExternalLog':
         await this.openExternalLog();
         return;
@@ -327,6 +337,86 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     const entries = parseLogs(body);
     const stats = summarize(entries);
     this.post({ type: 'logBody', logId, body, entries, stats });
+  }
+
+  async keepLog(logId: string, userId: string): Promise<void> {
+    const org = this.requireOrg(false);
+    const store = this.requireLogStore();
+    if (!org || !store) return;
+    const orgAlias = org.alias ?? org.username;
+    const body = await store.readBody(orgAlias, userId, logId);
+    if (body === undefined) {
+      vscode.window.showWarningMessage('Log not found locally — fetch it first.');
+      return;
+    }
+    const metas = await store.listStored(orgAlias);
+    const meta = metas.find(m => m.Id === logId);
+    if (!meta) {
+      vscode.window.showWarningMessage('Log metadata not found locally.');
+      return;
+    }
+    let summary: string | undefined;
+    if (await store.summaryExists(orgAlias, userId, logId)) {
+      try {
+        summary = await fs.readFile(store.summaryPath(orgAlias, userId, logId), 'utf8');
+      } catch { /* ignore */ }
+    }
+    try {
+      const result = await this.savedLogs.save(this.savedLogsFolderSetting(), { body, meta, summary });
+      this.postStatus(`Saved to ${this.displayPath(result.logPath)}`);
+      this.offerReveal(result.logPath);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[keep] ${message}`);
+      vscode.window.showErrorMessage(`Failed to save log: ${message}`);
+    }
+  }
+
+  async keepExternalLog(): Promise<void> {
+    if (!this.externalLog) {
+      vscode.window.showWarningMessage('No external log loaded.');
+      return;
+    }
+    const { sourcePath, body } = this.externalLog;
+    let summary: string | undefined;
+    const sibling = sourcePath.replace(/\.[^.]+$/, '') + '.summary.md';
+    try {
+      summary = await fs.readFile(sibling, 'utf8');
+    } catch { /* no sibling summary */ }
+    try {
+      const result = await this.savedLogs.saveExternal(this.savedLogsFolderSetting(), sourcePath, body, summary);
+      this.postStatus(`Saved to ${this.displayPath(result.logPath)}`);
+      this.offerReveal(result.logPath);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[keep:external] ${message}`);
+      vscode.window.showErrorMessage(`Failed to save log: ${message}`);
+    }
+  }
+
+  async openSavedLogsFolder(): Promise<void> {
+    const folder = this.savedLogs.resolveFolder(this.savedLogsFolderSetting());
+    try {
+      await fs.mkdir(folder, { recursive: true });
+    } catch { /* ignore */ }
+    await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(folder));
+  }
+
+  private savedLogsFolderSetting(): string {
+    return vscode.workspace.getConfiguration('sfLogReader').get<string>('savedLogsFolder', 'saved-logs');
+  }
+
+  private displayPath(absolute: string): string {
+    const relative = vscode.workspace.asRelativePath(absolute, false);
+    return relative === absolute ? absolute : relative;
+  }
+
+  private offerReveal(absolute: string): void {
+    void vscode.window.showInformationMessage(`Saved ${path.basename(absolute)}`, 'Reveal').then(choice => {
+      if (choice === 'Reveal') {
+        void vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(absolute));
+      }
+    });
   }
 
   async openExternalLog(uri?: vscode.Uri): Promise<void> {

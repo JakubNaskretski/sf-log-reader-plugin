@@ -13,6 +13,7 @@
   const externalBanner = document.getElementById('external-banner');
   const externalPathEl = document.getElementById('external-path');
   const externalSummaryBtn = document.getElementById('external-summary');
+  const externalKeepBtn = document.getElementById('external-keep');
   const externalCloseBtn = document.getElementById('external-close');
   const statusEl = document.getElementById('status');
   const logListEl = document.getElementById('log-list');
@@ -71,6 +72,15 @@
   openExternalBtn.addEventListener('click', () => post({ type: 'openExternalLog' }));
   clearLogsBtn.addEventListener('click', () => post({ type: 'deleteAllLogs' }));
   externalCloseBtn.addEventListener('click', () => post({ type: 'closeExternalLog' }));
+  externalKeepBtn.addEventListener('click', () => {
+    externalKeepBtn.disabled = true;
+    externalKeepBtn.textContent = 'Saving…';
+    post({ type: 'keepExternalLog' });
+    setTimeout(() => {
+      externalKeepBtn.disabled = false;
+      externalKeepBtn.innerHTML = '\u{1F4BE} Keep';
+    }, 2000);
+  });
   externalSummaryBtn.addEventListener('click', () => {
     externalSummaryBtn.disabled = true;
     externalSummaryBtn.textContent = 'Generating…';
@@ -204,6 +214,19 @@
     }
     detailHeaderEl.appendChild(wrap);
     if (!isExternal) {
+      const keepBtn = document.createElement('button');
+      keepBtn.innerHTML = '\u{1F4BE} Keep';
+      keepBtn.title = 'Copy this log into the saved-logs folder';
+      keepBtn.addEventListener('click', () => {
+        keepBtn.disabled = true;
+        keepBtn.textContent = 'Saving…';
+        post({ type: 'keepLog', logId, userId: state.activeUserId });
+        setTimeout(() => {
+          keepBtn.disabled = false;
+          keepBtn.innerHTML = '\u{1F4BE} Keep';
+        }, 2000);
+      });
+      detailHeaderEl.appendChild(keepBtn);
       const summaryBtn = document.createElement('button');
       summaryBtn.textContent = 'Generate summary';
       summaryBtn.title = 'Write a Markdown + Mermaid summary next to this log';

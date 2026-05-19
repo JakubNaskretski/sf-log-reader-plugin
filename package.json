@@ -83,6 +83,10 @@
       {
         "command": "sfLogReader.openLogFile",
         "title": "SF Log Reader: Open .log File…"
+      },
+      {
+        "command": "sfLogReader.openSavedLogsFolder",
+        "title": "SF Log Reader: Open Saved-Logs Folder"
       }
     ],
     "configuration": {
@@ -120,6 +124,11 @@
           "type": "string",
           "default": ".sf-logs",
           "description": "Folder (relative to workspace root) where fetched logs and summaries are stored."
+        },
+        "sfLogReader.savedLogsFolder": {
+          "type": "string",
+          "default": "saved-logs",
+          "description": "Folder where 'Keep' copies logs for long-term reference. Accepts a workspace-relative path, an absolute path, or '~' for the home directory. This folder is never touched by the storage cap cleanup."
         },
         "sfLogReader.commandTimeoutMs": {
           "type": "number",

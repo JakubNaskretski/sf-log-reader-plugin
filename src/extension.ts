@@ -25,7 +25,8 @@ export function activate(context: vscode.ExtensionContext): void {
       const userId = await vscode.window.showInputBox({ prompt: 'LogUserId (005…) that owns the log' });
       if (logId && userId) await provider.generateSummaryFor(logId, userId);
     }),
-    vscode.commands.registerCommand('sfLogReader.openLogFile', (uri?: vscode.Uri) => provider.openExternalLog(uri))
+    vscode.commands.registerCommand('sfLogReader.openLogFile', (uri?: vscode.Uri) => provider.openExternalLog(uri)),
+    vscode.commands.registerCommand('sfLogReader.openSavedLogsFolder', () => provider.openSavedLogsFolder())
   );
 }
 
