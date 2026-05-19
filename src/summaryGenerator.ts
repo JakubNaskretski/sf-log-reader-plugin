@@ -59,6 +59,26 @@ const CODE_UNIT_TRIGGER_RE = /^([^|]+?)\s+on\s+([^|]+?)\s+trigger event\s+([A-Za
 
 export interface SummaryOptions {
   mermaidMaxEdges?: number;
+  mermaidMaxNodes?: number;
+}
+
+interface ObservedCounts {
+  soqlQueries: number;
+  soqlRows: number;
+  soslQueries: number;
+  dmlStatements: number;
+  dmlRows: number;
+  callouts: number;
+  asyncJobsEnqueued: number;
+  publishImmediateEvents: number;
+}
+
+interface LimitException {
+  message: string;
+  metric?: string;
+  value?: number;
+  cap?: number;
+  lineRef: string;
 }
 
 export function generateSummary(meta: StoredLogMeta, body: string, options: SummaryOptions = {}): string {
@@ -68,8 +88,10 @@ export function generateSummary(meta: StoredLogMeta, body: string, options: Summ
   const soqlTimings = collectSoqlTimings(entries);
   const dmlBreakdown = collectDmlBreakdown(entries);
   const hottestMethods = collectHottestMethods(entries, 15);
+  const observed = collectObservedCounts(entries, soqlTimings, dmlBreakdown);
   const limits = parseLimits(body);
   const exceptions = entries.filter(e => e.category === 'EXCEPTION');
+  const limitExceptions = collectLimitExceptions(entries);
   const totalElapsedMs = computeTotalElapsedMs(entries);
 
   const lines: string[] = [];
@@ -80,8 +102,23 @@ export function generateSummary(meta: StoredLogMeta, body: string, options: Summ
   lines.push('## Event counts');
   lines.push(eventCountsTable(stats.byCategory, stats.total));
   lines.push('');
+  if (limitExceptions.length > 0) {
+    lines.push('## Limit exceptions');
+    for (const le of limitExceptions) {
+      const at = le.metric && le.value != null && le.cap != null
+        ? ` — hit at **${le.value}/${le.cap}** ${escapeMd(le.metric)}`
+        : '';
+      lines.push(`- \`${escapeMd(le.lineRef)}\` ${escapeMd(le.message)}${at}`);
+    }
+    lines.push('');
+  }
+  lines.push('## Observed counts (from log events)');
+  lines.push(observedCountsTable(observed, limitExceptions));
+  lines.push('');
   if (limits.length > 0) {
-    lines.push('## Governor limits (last reported)');
+    lines.push('## Reported governor snapshot');
+    lines.push('_Latest `LIMIT_USAGE_FOR_NS` snapshot SF emitted. This snapshot is written at frame boundaries, so it can lag the **Observed counts** above when the limit is hit inside a tight loop._');
+    lines.push('');
     lines.push(limitsTable(limits));
     lines.push('');
   }
@@ -105,7 +142,10 @@ export function generateSummary(meta: StoredLogMeta, body: string, options: Summ
   }
   lines.push('## Call graph');
   lines.push('');
-  lines.push(renderMermaid(byClass, edgeCalls, options.mermaidMaxEdges));
+  lines.push(renderMermaid(byClass, edgeCalls, {
+    maxEdges: options.mermaidMaxEdges,
+    maxNodes: options.mermaidMaxNodes
+  }));
   lines.push('');
   if (exceptions.length > 0) {
     lines.push('## Exceptions');
@@ -261,6 +301,90 @@ function parseMethod(entry: LogEntry): { className: string; detail: string } {
   const dot = signature.lastIndexOf('.');
   if (dot > 0) return { className: signature.slice(0, dot), detail: signature.slice(dot + 1) };
   return { className: signature || '(anonymous)', detail: '' };
+}
+
+function collectObservedCounts(entries: LogEntry[], soqlTimings: SoqlTiming[], dmlBreakdown: DmlOp[]): ObservedCounts {
+  const counts: ObservedCounts = {
+    soqlQueries: 0,
+    soqlRows: 0,
+    soslQueries: 0,
+    dmlStatements: 0,
+    dmlRows: 0,
+    callouts: 0,
+    asyncJobsEnqueued: 0,
+    publishImmediateEvents: 0
+  };
+  for (const e of entries) {
+    switch (e.eventType) {
+      case 'SOQL_EXECUTE_BEGIN': counts.soqlQueries += 1; break;
+      case 'SOSL_EXECUTE_BEGIN': counts.soslQueries += 1; break;
+      case 'DML_BEGIN': counts.dmlStatements += 1; break;
+      case 'CALLOUT_REQUEST': counts.callouts += 1; break;
+      case 'EVENT_SERVICE_PUB_DETAIL': counts.publishImmediateEvents += 1; break;
+      case 'ASYNC_OPERATION_INSERTED': counts.asyncJobsEnqueued += 1; break;
+    }
+  }
+  for (const t of soqlTimings) if (t.rows != null) counts.soqlRows += t.rows;
+  for (const d of dmlBreakdown) counts.dmlRows += d.rows;
+  return counts;
+}
+
+function collectLimitExceptions(entries: LogEntry[]): LimitException[] {
+  const out: LimitException[] = [];
+  const seen = new Set<string>();
+  for (const e of entries) {
+    if (e.eventType !== 'EXCEPTION_THROWN' && e.eventType !== 'FATAL_ERROR') continue;
+    if (!/LimitException/i.test(e.message)) continue;
+    const dedupeKey = `${e.lineRef}|${e.message.trim()}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    // Strip the "System.LimitException:" prefix, then peel off an optional "<metric>: <value>[ out of <cap>]" tail.
+    const stripped = e.message.replace(/^.*?LimitException:\s*/i, '').trim();
+    const m = stripped.match(/^(.+?)(?::\s*(\d+)(?:\s+out of\s+(\d+))?)?\s*$/i);
+    if (m) {
+      out.push({
+        message: e.message,
+        metric: m[1].trim(),
+        value: m[2] ? Number(m[2]) : undefined,
+        cap: m[3] ? Number(m[3]) : undefined,
+        lineRef: e.lineRef
+      });
+    } else {
+      out.push({ message: e.message, lineRef: e.lineRef });
+    }
+  }
+  return out;
+}
+
+function observedCountsTable(c: ObservedCounts, limitExceptions: LimitException[]): string {
+  const exMap = new Map<string, LimitException>();
+  for (const le of limitExceptions) if (le.metric) exMap.set(le.metric.toLowerCase(), le);
+  const lookup = (...keys: string[]) => {
+    for (const k of keys) {
+      for (const [name, le] of exMap.entries()) if (name.includes(k)) return le;
+    }
+    return undefined;
+  };
+  const rows: Array<[string, number, LimitException | undefined]> = [
+    ['SOQL queries', c.soqlQueries, lookup('soql queries', 'soql')],
+    ['SOQL rows returned', c.soqlRows, lookup('query rows')],
+    ['SOSL queries', c.soslQueries, lookup('sosl')],
+    ['DML statements', c.dmlStatements, lookup('dml statements')],
+    ['DML rows', c.dmlRows, lookup('dml rows')],
+    ['Callouts', c.callouts, lookup('callout')],
+    ['Async jobs enqueued', c.asyncJobsEnqueued, lookup('async')],
+    ['Platform events published', c.publishImmediateEvents, undefined]
+  ];
+  const visible = rows.filter(([, v, ex]) => v > 0 || ex);
+  if (visible.length === 0) return '_No countable events observed._';
+  const out = ['| Metric | Observed | Limit hit? |', '| --- | ---: | --- |'];
+  for (const [name, value, ex] of visible) {
+    const flag = ex
+      ? `❌ exceeded${ex.cap != null ? ` (\`${ex.value ?? '?'}/${ex.cap}\`)` : ex.value != null ? ` (at \`${ex.value}\`)` : ''}`
+      : '';
+    out.push(`| ${escapeMd(name)} | ${value} | ${flag} |`);
+  }
+  return out.join('\n');
 }
 
 function collectSoqlTimings(entries: LogEntry[]): SoqlTiming[] {
@@ -455,17 +579,47 @@ function hottestMethodsTable(methods: MethodCount[]): string {
   return out.join('\n');
 }
 
-function renderMermaid(byClass: Map<string, ClassStats>, edgeCalls: Map<string, Map<string, number>>, maxEdges?: number): string {
+interface MermaidOptions {
+  maxEdges?: number;
+  maxNodes?: number;
+}
+
+function renderMermaid(byClass: Map<string, ClassStats>, edgeCalls: Map<string, Map<string, number>>, options: MermaidOptions = {}): string {
   if (byClass.size === 0) return '_(no frames to diagram)_';
+  const maxNodes = Math.max(1, options.maxNodes ?? 60);
+  const maxEdges = Math.max(1, options.maxEdges ?? 400);
+
+  // Rank classes by activity so we drop the least useful first.
+  const activity = (s: ClassStats) =>
+    s.enters + s.soql * 2 + s.dml * 2 + s.exceptions * 3 + s.callouts * 2;
+  const ranked = Array.from(byClass.values()).sort((a, b) => activity(b) - activity(a));
+  const totalNodes = ranked.length;
+  const keptNodes = ranked.slice(0, maxNodes);
+  const droppedNodes = totalNodes - keptNodes.length;
+  const kept = new Set(keptNodes.map(s => s.className));
+
+  // Flatten edges (only between kept nodes), rank by call count desc.
+  type EdgeRec = { from: string; to: string; count: number };
+  const allEdges: EdgeRec[] = [];
+  for (const [from, tos] of edgeCalls.entries()) {
+    if (!kept.has(from)) continue;
+    for (const [to, count] of tos.entries()) {
+      if (!kept.has(to)) continue;
+      allEdges.push({ from, to, count });
+    }
+  }
+  allEdges.sort((a, b) => b.count - a.count);
+  const keptEdges = allEdges.slice(0, maxEdges);
+  const droppedEdges = allEdges.length - keptEdges.length;
+
   const ids = new Map<string, string>();
   let counter = 0;
-  for (const className of byClass.keys()) {
-    ids.set(className, `n${counter++}`);
-  }
-  const lines = ['```mermaid'];
-  if (maxEdges && maxEdges > 0) lines.push(`%%{init: {"maxEdges": ${maxEdges}}}%%`);
+  for (const s of keptNodes) ids.set(s.className, `n${counter++}`);
+
+  const lines: string[] = ['```mermaid'];
+  if (maxEdges > 0) lines.push(`%%{init: {"maxEdges": ${maxEdges}}}%%`);
   lines.push('flowchart TD');
-  for (const stats of byClass.values()) {
+  for (const stats of keptNodes) {
     const id = ids.get(stats.className)!;
     const labelLines: string[] = [escapeMermaidLabel(stats.className)];
     const counts = [
@@ -481,18 +635,23 @@ function renderMermaid(byClass: Map<string, ClassStats>, edgeCalls: Map<string, 
     lines.push(`  ${shape}`);
     if (stats.exceptions > 0) lines.push(`  class ${id} hasExc;`);
   }
-  for (const [from, tos] of edgeCalls.entries()) {
-    const fromId = ids.get(from);
-    if (!fromId) continue;
-    for (const [to, count] of tos.entries()) {
-      const toId = ids.get(to);
-      if (!toId) continue;
-      const label = count > 1 ? `|x${count}|` : '';
-      lines.push(`  ${fromId} -->${label} ${toId}`);
-    }
+  for (const edge of keptEdges) {
+    const fromId = ids.get(edge.from);
+    const toId = ids.get(edge.to);
+    if (!fromId || !toId) continue;
+    const label = edge.count > 1 ? `|x${edge.count}|` : '';
+    lines.push(`  ${fromId} -->${label} ${toId}`);
   }
   lines.push('  classDef hasExc fill:#f85149,stroke:#7a1d24,color:#fff;');
   lines.push('```');
+
+  if (droppedNodes > 0 || droppedEdges > 0) {
+    const parts: string[] = [];
+    if (droppedNodes > 0) parts.push(`${droppedNodes} less-active node${droppedNodes === 1 ? '' : 's'}`);
+    if (droppedEdges > 0) parts.push(`${droppedEdges} low-frequency edge${droppedEdges === 1 ? '' : 's'}`);
+    lines.push('');
+    lines.push(`> _Diagram trimmed for readability: ${parts.join(' and ')} omitted. Raise \`sfLogReader.mermaidMaxNodes\` / \`sfLogReader.mermaidMaxEdges\` to show more._`);
+  }
   return lines.join('\n');
 }
 

@@ -514,7 +514,7 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       LogLength: body.length
     };
     try {
-      const markdown = generateSummary(synthMeta, body, { mermaidMaxEdges: this.mermaidMaxEdges() });
+      const markdown = generateSummary(synthMeta, body, this.mermaidOptions());
       const target = sourcePath.replace(/\.[^.]+$/, '') + '.summary.md';
       await fs.writeFile(target, markdown, 'utf8');
       this.postStatus(`Summary written to ${vscode.workspace.asRelativePath(target)}`);
@@ -545,7 +545,7 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       return;
     }
     try {
-      const markdown = generateSummary(meta, body, { mermaidMaxEdges: this.mermaidMaxEdges() });
+      const markdown = generateSummary(meta, body, this.mermaidOptions());
       const target = await store.writeSummary(orgAlias, userId, logId, markdown);
       this.postStatus(`Summary written to ${vscode.workspace.asRelativePath(target)}`);
       await this.refreshStoredLogs();
@@ -559,8 +559,12 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private mermaidMaxEdges(): number {
-    return vscode.workspace.getConfiguration('sfLogReader').get<number>('mermaidMaxEdges', 500);
+  private mermaidOptions(): { mermaidMaxEdges: number; mermaidMaxNodes: number } {
+    const cfg = vscode.workspace.getConfiguration('sfLogReader');
+    return {
+      mermaidMaxEdges: cfg.get<number>('mermaidMaxEdges', 400),
+      mermaidMaxNodes: cfg.get<number>('mermaidMaxNodes', 60)
+    };
   }
 
   private async openLogInEditor(logId: string, userId: string): Promise<void> {
