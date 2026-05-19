@@ -41,6 +41,26 @@ export class LogStore {
     return path.join(this.userDir(orgAlias, userId), `${sanitize(logId)}.meta.json`);
   }
 
+  summaryPath(orgAlias: string, userId: string, logId: string): string {
+    return path.join(this.userDir(orgAlias, userId), `${sanitize(logId)}.summary.md`);
+  }
+
+  async writeSummary(orgAlias: string, userId: string, logId: string, markdown: string): Promise<string> {
+    const target = this.summaryPath(orgAlias, userId, logId);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, markdown, 'utf8');
+    return target;
+  }
+
+  async summaryExists(orgAlias: string, userId: string, logId: string): Promise<boolean> {
+    try {
+      await fs.access(this.summaryPath(orgAlias, userId, logId));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async exists(orgAlias: string, userId: string, logId: string): Promise<boolean> {
     try {
       await fs.access(this.logPath(orgAlias, userId, logId));
@@ -127,6 +147,7 @@ export class LogStore {
       const userId = meta.LogUserId ?? 'unknown';
       await fs.rm(this.logPath(meta.orgAlias!, userId, meta.Id), { force: true });
       await fs.rm(this.metaPath(meta.orgAlias!, userId, meta.Id), { force: true });
+      await fs.rm(this.summaryPath(meta.orgAlias!, userId, meta.Id), { force: true });
       removed += 1;
     }
     return removed;
