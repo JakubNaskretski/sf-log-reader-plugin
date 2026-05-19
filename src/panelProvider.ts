@@ -5,6 +5,7 @@ import { ApexLogRecord, OrgInfo, SfCliError, SfCliService, UserRecord } from './
 import { LogStore, StoredLogMeta } from './logStore';
 import { generateNonce, getPanelHtml } from './panelHtml';
 import { parseLogs, summarize } from './logParser';
+import { generateSummary } from './summaryGenerator';
 
 type InboundMessage =
   | { type: 'ready' }
@@ -16,6 +17,7 @@ type InboundMessage =
   | { type: 'refreshLogs' }
   | { type: 'selectLog'; logId: string; userId: string }
   | { type: 'openLogInEditor'; logId: string; userId: string }
+  | { type: 'generateSummary'; logId: string; userId: string }
   | { type: 'deleteAllLogs' }
   | { type: 'clearCommandTrail' }
   | { type: 'openLogFolder' };
@@ -45,6 +47,7 @@ interface LogViewModel {
   application?: string;
   request?: string;
   fetchedAt: string;
+  hasSummary: boolean;
 }
 
 export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
@@ -184,8 +187,8 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     const metas = await store.listStored(orgAlias);
     const userId = this.orgStore.getUser(org.username);
     const filtered = userId ? metas.filter(m => m.LogUserId === userId) : metas;
-    const vm: LogViewModel[] = filtered
-      .map(m => ({
+    const vm: LogViewModel[] = await Promise.all(
+      filtered.map(async m => ({
         id: m.Id,
         userId: m.LogUserId ?? 'unknown',
         userName: m.LogUserName,
@@ -196,9 +199,11 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
         operation: m.Operation,
         application: m.Application,
         request: m.Request,
-        fetchedAt: m.fetchedAt
+        fetchedAt: m.fetchedAt,
+        hasSummary: await store.summaryExists(orgAlias, m.LogUserId ?? 'unknown', m.Id)
       }))
-      .sort((a, b) => (b.startTime ?? '').localeCompare(a.startTime ?? ''));
+    );
+    vm.sort((a, b) => (b.startTime ?? '').localeCompare(a.startTime ?? ''));
     this.post({ type: 'logs', logs: vm });
     this.postUsers(metas);
   }
@@ -271,6 +276,9 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       case 'openLogInEditor':
         await this.openLogInEditor(message.logId, message.userId);
         return;
+      case 'generateSummary':
+        await this.generateSummaryFor(message.logId, message.userId);
+        return;
       case 'deleteAllLogs':
         await this.clearLocalLogs();
         return;
@@ -296,6 +304,37 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     const entries = parseLogs(body);
     const stats = summarize(entries);
     this.post({ type: 'logBody', logId, body, entries, stats });
+  }
+
+  async generateSummaryFor(logId: string, userId: string): Promise<void> {
+    const org = this.requireOrg(false);
+    const store = this.requireLogStore();
+    if (!org || !store) return;
+    const orgAlias = org.alias ?? org.username;
+    const body = await store.readBody(orgAlias, userId, logId);
+    if (body === undefined) {
+      vscode.window.showWarningMessage('Log not found locally — fetch it first.');
+      return;
+    }
+    const metas = await store.listStored(orgAlias);
+    const meta = metas.find(m => m.Id === logId);
+    if (!meta) {
+      vscode.window.showWarningMessage('Log metadata not found locally.');
+      return;
+    }
+    try {
+      const markdown = generateSummary(meta, body);
+      const target = await store.writeSummary(orgAlias, userId, logId, markdown);
+      this.postStatus(`Summary written to ${vscode.workspace.asRelativePath(target)}`);
+      await this.refreshStoredLogs();
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(target));
+      await vscode.window.showTextDocument(doc, { preview: false });
+      await vscode.commands.executeCommand('markdown.showPreviewToSide', vscode.Uri.file(target));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[summary] ${message}`);
+      vscode.window.showErrorMessage(`Failed to generate summary: ${message}`);
+    }
   }
 
   private async openLogInEditor(logId: string, userId: string): Promise<void> {

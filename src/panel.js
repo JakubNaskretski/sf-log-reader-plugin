@@ -138,7 +138,8 @@
       top.className = 'row-top';
       const user = document.createElement('span');
       user.className = 'row-user';
-      user.textContent = log.userName || log.userId || 'unknown';
+      user.textContent = (log.hasSummary ? '¶ ' : '') + (log.userName || log.userId || 'unknown');
+      if (log.hasSummary) user.title = 'Summary available';
       const time = document.createElement('span');
       time.className = 'row-time';
       time.textContent = formatTime(log.startTime);
@@ -181,6 +182,15 @@
       if (count > 0) wrap.appendChild(makeStat(cat, count));
     }
     detailHeaderEl.appendChild(wrap);
+    const summaryBtn = document.createElement('button');
+    summaryBtn.textContent = 'Generate summary';
+    summaryBtn.title = 'Write a Markdown + Mermaid summary next to this log';
+    summaryBtn.addEventListener('click', () => {
+      summaryBtn.disabled = true;
+      summaryBtn.textContent = 'Generating…';
+      post({ type: 'generateSummary', logId, userId: state.activeUserId });
+    });
+    detailHeaderEl.appendChild(summaryBtn);
     const openBtn = document.createElement('button');
     openBtn.textContent = 'Open file';
     openBtn.title = 'Open the .log file in an editor tab';

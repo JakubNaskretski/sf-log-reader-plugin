@@ -19,7 +19,12 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('sfLogReader.selectOrg', () => provider.pickOrg()),
     vscode.commands.registerCommand('sfLogReader.selectUser', () => provider.pickUser()),
     vscode.commands.registerCommand('sfLogReader.openLogFolder', () => provider.openLogFolder()),
-    vscode.commands.registerCommand('sfLogReader.clearLocalLogs', () => provider.clearLocalLogs())
+    vscode.commands.registerCommand('sfLogReader.clearLocalLogs', () => provider.clearLocalLogs()),
+    vscode.commands.registerCommand('sfLogReader.generateSummary', async () => {
+      const logId = await vscode.window.showInputBox({ prompt: 'ApexLog Id (07L…) to summarize' });
+      const userId = await vscode.window.showInputBox({ prompt: 'LogUserId (005…) that owns the log' });
+      if (logId && userId) await provider.generateSummaryFor(logId, userId);
+    })
   );
 }
 

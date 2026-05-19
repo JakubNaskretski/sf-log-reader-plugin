@@ -75,6 +75,10 @@
       {
         "command": "sfLogReader.clearLocalLogs",
         "title": "SF Log Reader: Clear Local Logs For Current Org"
+      },
+      {
+        "command": "sfLogReader.generateSummary",
+        "title": "SF Log Reader: Generate Summary For Log"
       }
     ],
     "configuration": {
