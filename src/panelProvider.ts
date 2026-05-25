@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
+import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
+import * as os from 'os';
 import * as path from 'path';
 import { CommandTrail, CommandTrailEntry } from './commandTrail';
 import { OrgStore } from './orgStore';
@@ -698,22 +700,154 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   }
 
   private getLogStore(): LogStore | undefined {
-    const folder = vscode.workspace.workspaceFolders?.[0];
-    if (!folder) return undefined;
-    const folderName = vscode.workspace.getConfiguration('sfLogReader').get<string>('logFolderName', '.sf-logs');
-    return new LogStore(folder.uri, folderName);
+    const workspace = vscode.workspace.workspaceFolders?.[0];
+    if (!workspace) return undefined;
+    const setting = (vscode.workspace.getConfiguration('sfLogReader').get<string>('logFolderName', '') ?? '').trim();
+    let basePath: string;
+    if (!setting) {
+      basePath = path.join(this.context.globalStorageUri.fsPath, 'logs', workspaceKey(workspace));
+    } else if (setting.startsWith('~')) {
+      basePath = path.join(os.homedir(), setting.slice(1));
+    } else if (path.isAbsolute(setting)) {
+      basePath = setting;
+    } else {
+      basePath = path.join(workspace.uri.fsPath, setting);
+    }
+    return new LogStore(basePath);
   }
 
   private requireLogStore(): LogStore | undefined {
     const store = this.getLogStore();
     if (!store) {
-      vscode.window.showWarningMessage('Open a workspace folder first — fetched logs are saved relative to it.');
+      vscode.window.showWarningMessage('Open a workspace folder first — logs are partitioned per workspace.');
     }
     return store;
   }
 
   private post(message: unknown): void {
     this.view?.webview.postMessage(message);
+  }
+}
+
+function workspaceKey(workspace: vscode.WorkspaceFolder): string {
+  const name = workspace.name.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 40) || 'workspace';
+  const hash = crypto.createHash('sha1').update(workspace.uri.fsPath).digest('hex').slice(0, 8);
+  return `${name}-${hash}`;
+}
+
+const LEGACY_MIGRATION_KEY = 'sfLogReader.legacyMigration.v1';
+
+export async function migrateLegacyStorage(context: vscode.ExtensionContext): Promise<void> {
+  const workspace = vscode.workspace.workspaceFolders?.[0];
+  if (!workspace) return;
+  if (context.workspaceState.get<boolean>(LEGACY_MIGRATION_KEY)) return;
+
+  const cfg = vscode.workspace.getConfiguration('sfLogReader');
+  const logSetting = (cfg.get<string>('logFolderName', '') ?? '').trim();
+  const savedSetting = (cfg.get<string>('savedLogsFolder', '') ?? '').trim();
+
+  const moves: Array<{ from: string; to: string; label: string }> = [];
+  if (!logSetting) {
+    const from = path.join(workspace.uri.fsPath, '.sf-logs');
+    if (await dirHasContent(from)) {
+      moves.push({ from, to: path.join(context.globalStorageUri.fsPath, 'logs', workspaceKey(workspace)), label: '.sf-logs' });
+    }
+  }
+  if (!savedSetting) {
+    const from = path.join(workspace.uri.fsPath, 'saved-logs');
+    if (await dirHasContent(from)) {
+      moves.push({ from, to: path.join(os.homedir(), 'sf-saved-logs'), label: 'saved-logs' });
+    }
+  }
+
+  if (moves.length === 0) {
+    await context.workspaceState.update(LEGACY_MIGRATION_KEY, true);
+    return;
+  }
+
+  const moved: string[] = [];
+  const failed: string[] = [];
+  for (const m of moves) {
+    try {
+      await fs.mkdir(m.to, { recursive: true });
+      await mergeMove(m.from, m.to);
+      await pruneEmptyDirs(m.from);
+      moved.push(m.label);
+    } catch (err) {
+      failed.push(`${m.label}: ${(err as Error).message}`);
+    }
+  }
+
+  if (failed.length === 0) {
+    await context.workspaceState.update(LEGACY_MIGRATION_KEY, true);
+  }
+  if (moved.length > 0) {
+    vscode.window.showInformationMessage(
+      `SF Log Reader: moved ${moved.join(' and ')} out of the workspace so they no longer appear in git. New location: global storage / ~/sf-saved-logs.`
+    );
+  }
+  if (failed.length > 0) {
+    vscode.window.showWarningMessage(`SF Log Reader: migration issues — ${failed.join('; ')}`);
+  }
+}
+
+async function dirHasContent(dir: string): Promise<boolean> {
+  try {
+    const entries = await fs.readdir(dir);
+    return entries.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function mergeMove(src: string, dest: string): Promise<void> {
+  const entries = await fs.readdir(src, { withFileTypes: true });
+  for (const entry of entries) {
+    const from = path.join(src, entry.name);
+    const to = path.join(dest, entry.name);
+    if (entry.isDirectory()) {
+      await fs.mkdir(to, { recursive: true });
+      await mergeMove(from, to);
+    } else {
+      try {
+        await fs.access(to);
+        await fs.rm(from, { force: true });
+      } catch {
+        try {
+          await fs.rename(from, to);
+        } catch (err: unknown) {
+          if ((err as NodeJS.ErrnoException).code === 'EXDEV') {
+            await fs.copyFile(from, to);
+            await fs.rm(from, { force: true });
+          } else {
+            throw err;
+          }
+        }
+      }
+    }
+  }
+}
+
+async function pruneEmptyDirs(dir: string): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await fs.readdir(dir);
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    const full = path.join(dir, name);
+    try {
+      const stat = await fs.stat(full);
+      if (stat.isDirectory()) await pruneEmptyDirs(full);
+    } catch {
+      // skip
+    }
+  }
+  try {
+    await fs.rmdir(dir);
+  } catch {
+    // not empty or already gone
   }
 }
 

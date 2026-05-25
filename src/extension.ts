@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { CommandTrail } from './commandTrail';
 import { SfCliService } from './sfCliService';
 import { OrgStore } from './orgStore';
-import { LogReaderPanelProvider } from './panelProvider';
+import { LogReaderPanelProvider, migrateLegacyStorage } from './panelProvider';
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel('SF Log Reader');
@@ -10,6 +10,10 @@ export function activate(context: vscode.ExtensionContext): void {
   const sf = new SfCliService(trail);
   const orgStore = new OrgStore(context.globalState);
   const provider = new LogReaderPanelProvider(context, sf, orgStore, trail, output);
+
+  migrateLegacyStorage(context).catch(err => {
+    output.appendLine(`Legacy storage migration failed: ${(err as Error).message}`);
+  });
 
   context.subscriptions.push(
     output,

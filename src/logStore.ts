@@ -1,4 +1,3 @@
-import * as vscode from 'vscode';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { ApexLogRecord } from './sfCliService';
@@ -16,13 +15,10 @@ export interface FetchResult {
 }
 
 export class LogStore {
-  constructor(
-    private readonly workspaceRoot: vscode.Uri,
-    private readonly folderName: string
-  ) {}
+  constructor(private readonly basePath: string) {}
 
   private rootDir(): string {
-    return path.join(this.workspaceRoot.fsPath, this.folderName);
+    return this.basePath;
   }
 
   private orgDir(orgAlias: string): string {

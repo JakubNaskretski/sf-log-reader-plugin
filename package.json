@@ -2,7 +2,7 @@
   "name": "sf-log-reader",
   "displayName": "SF Log Reader",
   "description": "Browse, fetch, and filter Salesforce debug logs from any authenticated org, surfaced in a bottom-panel webview.",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "publisher": "Skrety",
   "license": "MIT",
   "repository": {
@@ -129,13 +129,13 @@
         },
         "sfLogReader.logFolderName": {
           "type": "string",
-          "default": ".sf-logs",
-          "description": "Folder (relative to workspace root) where fetched logs and summaries are stored."
+          "default": "",
+          "description": "Where fetched logs and summaries are stored. Leave blank (default) to use the extension's private global storage, partitioned per workspace, so logs never appear in the workspace tree or git. Otherwise accepts a workspace-relative path, an absolute path, or '~' for the home directory."
         },
         "sfLogReader.savedLogsFolder": {
           "type": "string",
-          "default": "saved-logs",
-          "description": "Folder where 'Keep' copies logs for long-term reference. Accepts a workspace-relative path, an absolute path, or '~' for the home directory. This folder is never touched by the storage cap cleanup."
+          "default": "",
+          "description": "Folder where 'Keep' copies logs for long-term reference. Leave blank (default) to use '~/sf-saved-logs'. Otherwise accepts a workspace-relative path, an absolute path, or '~' for the home directory. This folder is never touched by the storage cap cleanup."
         },
         "sfLogReader.commandTimeoutMs": {
           "type": "number",
