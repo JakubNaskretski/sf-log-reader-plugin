@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { randomBytes } from 'crypto';
 
 export function getPanelHtml(webview: vscode.Webview, extensionUri: vscode.Uri, nonce: string): string {
   const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'out', 'panel.js'));
@@ -392,10 +393,6 @@ export function getPanelHtml(webview: vscode.Webview, extensionUri: vscode.Uri, 
 }
 
 export function generateNonce(): string {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let result = '';
-  for (let i = 0; i < 32; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
+  // CSPRNG (not Math.random) so the CSP script nonce isn't predictable.
+  return randomBytes(16).toString('base64').replace(/[^A-Za-z0-9]/g, '').slice(0, 32);
 }

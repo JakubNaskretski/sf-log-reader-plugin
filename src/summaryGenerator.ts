@@ -279,15 +279,25 @@ function walk(entries: LogEntry[]): {
   return { frames, byClass, edgeCalls };
 }
 
-function parseCodeUnit(entry: LogEntry): { className: string; detail: string; isTrigger: boolean } {
+/** Exported for tests. */
+export function parseCodeUnit(entry: LogEntry): { className: string; detail: string; isTrigger: boolean } {
   const parts = entry.message.split(' | ').map(s => s.trim()).filter(Boolean);
-  const candidate = parts[parts.length - 1] ?? '';
-  if (TRIGGER_EVENT_RE.test(candidate)) {
-    const m = candidate.match(CODE_UNIT_TRIGGER_RE);
+  // Triggers: the descriptor "<Name> on <SObject> trigger event <Phase>" can sit
+  // in any segment — the LAST segment is usually the "__sfdc_trigger/<Name>" marker.
+  // Search for the descriptor rather than assuming it's the last segment.
+  const triggerSeg = parts.find(p => TRIGGER_EVENT_RE.test(p));
+  if (triggerSeg) {
+    const m = triggerSeg.match(CODE_UNIT_TRIGGER_RE);
     if (m) return { className: m[1].trim(), detail: `${m[3]} on ${m[2].trim()}`, isTrigger: true };
-    const first = candidate.split(/\s+/)[0] ?? candidate;
-    return { className: first, detail: candidate, isTrigger: true };
+    const first = triggerSeg.split(/\s+/)[0] ?? triggerSeg;
+    return { className: first, detail: triggerSeg, isTrigger: true };
   }
+  // Fall back to the trigger name from a "__sfdc_trigger/<Name>" marker segment.
+  const marker = parts.find(p => /^__sfdc_trigger\//.test(p));
+  if (marker) {
+    return { className: marker.replace(/^__sfdc_trigger\//, ''), detail: '', isTrigger: true };
+  }
+  const candidate = parts[parts.length - 1] ?? '';
   const dot = candidate.indexOf('.');
   if (dot > 0) return { className: candidate.slice(0, dot), detail: candidate.slice(dot + 1), isTrigger: false };
   return { className: candidate || '(anonymous)', detail: '', isTrigger: false };
@@ -334,23 +344,25 @@ function collectLimitExceptions(entries: LogEntry[]): LimitException[] {
   const seen = new Set<string>();
   for (const e of entries) {
     if (e.eventType !== 'EXCEPTION_THROWN' && e.eventType !== 'FATAL_ERROR') continue;
-    if (!/LimitException/i.test(e.message)) continue;
-    const dedupeKey = `${e.lineRef}|${e.message.trim()}`;
+    // Message can now include an appended stack trace — match against the header line only.
+    const header = e.message.split('\n', 1)[0];
+    if (!/LimitException/i.test(header)) continue;
+    const dedupeKey = `${e.lineRef}|${header.trim()}`;
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
     // Strip the "System.LimitException:" prefix, then peel off an optional "<metric>: <value>[ out of <cap>]" tail.
-    const stripped = e.message.replace(/^.*?LimitException:\s*/i, '').trim();
+    const stripped = header.replace(/^.*?LimitException:\s*/i, '').trim();
     const m = stripped.match(/^(.+?)(?::\s*(\d+)(?:\s+out of\s+(\d+))?)?\s*$/i);
     if (m) {
       out.push({
-        message: e.message,
+        message: header,
         metric: m[1].trim(),
         value: m[2] ? Number(m[2]) : undefined,
         cap: m[3] ? Number(m[3]) : undefined,
         lineRef: e.lineRef
       });
     } else {
-      out.push({ message: e.message, lineRef: e.lineRef });
+      out.push({ message: header, lineRef: e.lineRef });
     }
   }
   return out;
@@ -387,19 +399,29 @@ function observedCountsTable(c: ObservedCounts, limitExceptions: LimitException[
   return out.join('\n');
 }
 
+/**
+ * Extract the SOQL text (and Aggregations field) from a SOQL_EXECUTE_BEGIN line.
+ * The query itself can contain `|` (e.g. `WHERE Name = 'a|b'`), so we read it
+ * verbatim from the raw line rather than splitting on `|` and taking a segment.
+ * Exported for tests.
+ */
+export function extractSoqlFromRaw(entry: LogEntry): { query: string; aggregations?: string } {
+  const firstLine = entry.raw.split('\n', 1)[0];
+  const fields = firstLine.split('|'); // [ts, EVENT, lineRef, Aggregations:N, ...query]
+  const aggIdx = fields.findIndex(f => /^\s*Aggregations:/i.test(f));
+  if (aggIdx >= 0) {
+    return { aggregations: fields[aggIdx].trim(), query: fields.slice(aggIdx + 1).join('|').trim() };
+  }
+  return { query: fields.slice(3).join('|').trim() };
+}
+
 function collectSoqlTimings(entries: LogEntry[]): SoqlTiming[] {
   const stack: Array<{ index: number; entry: LogEntry; query: string; aggregations?: string }> = [];
   const out: SoqlTiming[] = [];
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
     if (e.eventType === 'SOQL_EXECUTE_BEGIN') {
-      const segments = e.message.split(' | ').map(s => s.trim()).filter(Boolean);
-      let aggregations: string | undefined;
-      let query = segments[segments.length - 1] ?? '';
-      if (segments[0] && /^Aggregations:/i.test(segments[0])) {
-        aggregations = segments[0];
-        if (segments.length > 1) query = segments[segments.length - 1];
-      }
+      const { query, aggregations } = extractSoqlFromRaw(e);
       stack.push({ index: i, entry: e, query, aggregations });
     } else if (e.eventType === 'SOQL_EXECUTE_END') {
       const open = stack.pop();
@@ -457,15 +479,21 @@ function collectHottestMethods(entries: LogEntry[], limit: number): MethodCount[
     .slice(0, limit);
 }
 
-function parseLimits(raw: string): LimitMetric[] {
+/** Exported for tests. */
+export function parseLimits(raw: string): LimitMetric[] {
   if (!raw) return [];
   const lines = raw.split('\n');
   let inBlock = false;
+  let ns = '';
+  // Key by namespace + metric so a managed package's LIMIT_USAGE_FOR_NS block does
+  // not overwrite the (default) namespace's metrics (they share metric names).
   const latest = new Map<string, LimitMetric>();
   for (const rawLine of lines) {
     const line = rawLine.replace(/\r$/, '');
-    if (line.includes('|LIMIT_USAGE_FOR_NS|') || /^LIMIT_USAGE_FOR_NS\|/.test(line.trim())) {
+    const nsMatch = line.match(/\|LIMIT_USAGE_FOR_NS\|([^|]*)\|/) || line.trim().match(/^LIMIT_USAGE_FOR_NS\|([^|]*)\|/);
+    if (nsMatch) {
       inBlock = true;
+      ns = (nsMatch[1] ?? '').trim();
       continue;
     }
     if (!inBlock) continue;
@@ -474,7 +502,9 @@ function parseLimits(raw: string): LimitMetric[] {
     if (/^\d{2}:\d{2}:\d{2}/.test(trimmed)) { inBlock = false; continue; }
     const m = trimmed.match(/^(.+?):\s*(\d+)\s+out of\s+(\d+)/i);
     if (m) {
-      const name = m[1].replace(/^Number of\s+/i, '').trim();
+      const metric = m[1].replace(/^Number of\s+/i, '').trim();
+      const isDefault = !ns || /^\(default\)$/i.test(ns);
+      const name = isDefault ? metric : `${ns}: ${metric}`;
       latest.set(name, { name, used: Number(m[2]), max: Number(m[3]) });
     }
   }
@@ -692,5 +722,13 @@ function escapeMd(s: string): string {
 }
 
 function escapeMermaidLabel(s: string): string {
-  return s.replace(/"/g, '\\"').replace(/[\r\n]+/g, ' ');
+  // Mermaid does NOT honor backslash-escaped quotes inside ["..."] labels, and
+  // " [ ] { } | ; < > terminate or corrupt the label — replace them with safe
+  // equivalents so a class/trigger name containing them can't break the diagram.
+  return s
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/"/g, "'")
+    .replace(/[<>]/g, '')
+    .replace(/[\[\]{}|;]/g, ' ')
+    .trim();
 }

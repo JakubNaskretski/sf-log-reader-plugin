@@ -258,7 +258,15 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   private async handleMessage(message: InboundMessage): Promise<void> {
     switch (message.type) {
       case 'ready':
-        await this.loadOrgs();
+        // The webview is torn down whenever the bottom-pane tab is switched away,
+        // so 'ready' fires on every re-show. Reuse cached orgs to avoid re-shelling
+        // out to `sf org list` on each tab switch — the provider instance lives
+        // across view recreations, so `this.orgs` is still populated.
+        if (this.orgs.length > 0) {
+          this.postOrgs();
+        } else {
+          await this.loadOrgs();
+        }
         this.postCommandTrail();
         await this.refreshStoredLogs();
         return;
@@ -666,8 +674,15 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   private reportCliError(action: string, err: unknown): void {
     const message = err instanceof Error ? err.message : String(err);
     this.output.appendLine(`[${action}] error: ${message}`);
-    if (err instanceof SfCliError && err.stderr) this.output.appendLine(err.stderr);
-    this.post({ type: 'status', text: `${action} failed — see SF Log Reader output channel`, error: true });
+    const stderr = err instanceof SfCliError ? err.stderr : undefined;
+    if (stderr) this.output.appendLine(stderr);
+    // Surface the actual reason inline (not just "see the output channel") so the
+    // user can act on it — e.g. CLI not found, not authenticated, expired session.
+    const snippet = ((stderr && stderr.trim()) || message).split('\n')[0].slice(0, 200);
+    this.post({ type: 'status', text: `${action} failed: ${snippet}`, error: true });
+    void vscode.window.showErrorMessage(`SF Log Reader: ${action} failed. ${snippet}`, 'Show Output').then(choice => {
+      if (choice === 'Show Output') this.output.show(true);
+    });
   }
 
   private async checkStorage(store: LogStore, orgAlias: string, maxMB: number): Promise<void> {
@@ -701,16 +716,20 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
 
   private getLogStore(): LogStore | undefined {
     const workspace = vscode.workspace.workspaceFolders?.[0];
-    if (!workspace) return undefined;
     const setting = (vscode.workspace.getConfiguration('sfLogReader').get<string>('logFolderName', '') ?? '').trim();
     let basePath: string;
     if (!setting) {
-      basePath = path.join(this.context.globalStorageUri.fsPath, 'logs', workspaceKey(workspace));
+      // Default: global storage, partitioned per workspace — or a shared partition
+      // when no workspace is open, so the extension still works on loose .log files.
+      const key = workspace ? workspaceKey(workspace) : 'no-workspace';
+      basePath = path.join(this.context.globalStorageUri.fsPath, 'logs', key);
     } else if (setting.startsWith('~')) {
       basePath = path.join(os.homedir(), setting.slice(1));
     } else if (path.isAbsolute(setting)) {
       basePath = setting;
     } else {
+      // Only a workspace-relative path genuinely needs an open workspace folder.
+      if (!workspace) return undefined;
       basePath = path.join(workspace.uri.fsPath, setting);
     }
     return new LogStore(basePath);
@@ -719,7 +738,9 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   private requireLogStore(): LogStore | undefined {
     const store = this.getLogStore();
     if (!store) {
-      vscode.window.showWarningMessage('Open a workspace folder first — logs are partitioned per workspace.');
+      vscode.window.showWarningMessage(
+        'The `sfLogReader.logFolderName` setting is a workspace-relative path but no folder is open. Open a folder, or set it to an absolute path or one starting with `~/`.'
+      );
     }
     return store;
   }

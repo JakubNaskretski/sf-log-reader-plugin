@@ -2,7 +2,7 @@
   "name": "sf-log-reader",
   "displayName": "SF Log Reader",
   "description": "Browse, fetch, and filter Salesforce debug logs from any authenticated org, surfaced in a bottom-panel webview.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publisher": "Skrety",
   "license": "MIT",
   "repository": {
@@ -89,6 +89,40 @@
         "title": "SF Log Reader: Open Saved-Logs Folder"
       }
     ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "sfLogReader.fetchLatest",
+          "when": "view == sfLogReader.panelView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "sfLogReader.refresh",
+          "when": "view == sfLogReader.panelView",
+          "group": "navigation@2"
+        },
+        {
+          "command": "sfLogReader.selectOrg",
+          "when": "view == sfLogReader.panelView",
+          "group": "1_setup@1"
+        },
+        {
+          "command": "sfLogReader.selectUser",
+          "when": "view == sfLogReader.panelView",
+          "group": "1_setup@2"
+        },
+        {
+          "command": "sfLogReader.openLogFolder",
+          "when": "view == sfLogReader.panelView",
+          "group": "2_folders@1"
+        },
+        {
+          "command": "sfLogReader.clearLocalLogs",
+          "when": "view == sfLogReader.panelView",
+          "group": "3_danger@1"
+        }
+      ]
+    },
     "configuration": {
       "title": "SF Log Reader",
       "properties": {
