@@ -29,34 +29,55 @@
   const trailCountEl = document.getElementById('trail-count');
   const clearTrailBtn = document.getElementById('clear-trail');
 
+  // VS Code tears the webview down whenever the bottom-pane tab is switched away.
+  // Persist enough state via vscode.setState/getState that re-show is instant —
+  // the selected log + parsed entries re-render before the host responds.
+  const saved = vscode.getState() || {};
   const state = {
     orgs: [],
     selectedOrg: null,
     users: [],
     selectedUser: null,
     logs: [],
-    activeLogId: null,
-    activeUserId: null,
-    entries: [],
-    filters: new Set(['USER_DEBUG', 'SOQL', 'DML', 'EXCEPTION', 'CALLOUT']),
-    search: '',
+    activeLogId: saved.activeLogId ?? null,
+    activeUserId: saved.activeUserId ?? null,
+    entries: saved.entries ?? [],
+    stats: saved.stats ?? null,
+    filters: new Set(saved.filters ?? ['USER_DEBUG', 'SOQL', 'DML', 'EXCEPTION', 'CALLOUT']),
+    search: saved.search ?? '',
     trail: [],
     external: null,
     selected: new Set()
   };
 
+  function persistState() {
+    vscode.setState({
+      activeLogId: state.activeLogId,
+      activeUserId: state.activeUserId,
+      entries: state.entries,
+      stats: state.stats,
+      filters: Array.from(state.filters),
+      search: state.search
+    });
+  }
+
   function post(message) { vscode.postMessage(message); }
 
   document.querySelectorAll('.filters input[type="checkbox"]').forEach(cb => {
+    // Apply restored filter state to checkbox first
+    cb.checked = state.filters.has(cb.dataset.cat);
     cb.addEventListener('change', () => {
       if (cb.checked) state.filters.add(cb.dataset.cat);
       else state.filters.delete(cb.dataset.cat);
+      persistState();
       renderEntries();
     });
   });
 
+  if (state.search) searchEl.value = state.search;
   searchEl.addEventListener('input', () => {
     state.search = searchEl.value.toLowerCase();
+    persistState();
     renderEntries();
   });
 
@@ -191,6 +212,9 @@
       row.addEventListener('click', () => {
         state.activeLogId = log.id;
         state.activeUserId = log.userId;
+        state.entries = [];
+        state.stats = null;
+        persistState();
         if (state.external) {
           state.external = null;
           externalBanner.classList.remove('visible');
@@ -446,8 +470,14 @@
           state.activeLogId = null;
           state.activeUserId = null;
           state.entries = [];
+          state.stats = null;
+          persistState();
           renderDetailHeader(null);
           renderEntries();
+        } else if (state.activeLogId && state.entries.length === 0) {
+          // We restored an activeLogId from saved state but have no entries cached
+          // (e.g. the user reloaded the window). Ask the host to refetch the body.
+          post({ type: 'selectLog', logId: state.activeLogId, userId: state.activeUserId });
         }
         // Drop selections for logs no longer present
         const visible = new Set(state.logs.map(l => l.id));
@@ -460,6 +490,8 @@
         state.external = null;
         externalBanner.classList.remove('visible');
         state.entries = msg.entries || [];
+        state.stats = msg.stats || null;
+        persistState();
         renderDetailHeader(msg.stats, msg.logId, false);
         if (msg.error) {
           detailBodyEl.innerHTML = `<div class="empty">${escapeHtml(msg.error)}</div>`;
@@ -495,6 +527,14 @@
         break;
     }
   });
+
+  // Paint cached entries immediately so a tab switch doesn't blank the detail pane
+  // while the host re-posts orgs/logs. If we have no cached entries but DO have an
+  // activeLogId, the 'logs' handler will request the body once the list arrives.
+  if (state.entries.length > 0) {
+    renderDetailHeader(state.stats, state.activeLogId, false);
+    renderEntries();
+  }
 
   post({ type: 'ready' });
 })();

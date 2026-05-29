@@ -163,7 +163,11 @@ export class LogStore {
 }
 
 function sanitize(input: string): string {
-  return input.replace(/[^A-Za-z0-9._-]/g, '_');
+  const cleaned = input.replace(/[^A-Za-z0-9._-]/g, '_');
+  // Never allow a path segment that is "." or ".." (directory traversal) — a
+  // crafted/garbage logId/userId/orgAlias must stay inside the store root.
+  if (/^\.+$/.test(cleaned)) return '_'.repeat(cleaned.length);
+  return cleaned;
 }
 
 async function walkSize(dir: string): Promise<number> {

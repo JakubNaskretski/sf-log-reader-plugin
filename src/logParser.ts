@@ -47,24 +47,45 @@ export interface LogStats {
   byEventType: Record<string, number>;
 }
 
+const LINE_REF_RE = /^\[.+\]$/;
+
 export function parseLogs(raw: string): LogEntry[] {
   if (!raw) return [];
   const entries: LogEntry[] = [];
   const lines = raw.split('\n');
+  let last: LogEntry | null = null;
   for (let i = 0; i < lines.length; i++) {
     const trimmed = lines[i].trim();
     if (!trimmed) continue;
     if (/^\d+\.\d+\s+\w/.test(trimmed) && trimmed.includes('APEX_CODE')) continue;
     const pipeIdx = trimmed.indexOf('|');
-    if (pipeIdx === -1) continue;
-    const timestampField = trimmed.slice(0, pipeIdx);
-    if (!/^\d{2}:\d{2}:\d{2}/.test(timestampField)) continue;
+    const timestampField = pipeIdx === -1 ? '' : trimmed.slice(0, pipeIdx);
+    const isNewEntry = pipeIdx !== -1 && /^\d{2}:\d{2}:\d{2}/.test(timestampField);
+    if (!isNewEntry) {
+      // Continuation line — Salesforce emits multi-line bodies (stack traces under
+      // FATAL_ERROR, LIMIT_USAGE_FOR_NS body, variable dumps, etc.) on untimestamped
+      // follow-up lines. Attach them to the previous entry instead of dropping.
+      if (last) {
+        last.message = last.message ? `${last.message}\n${trimmed}` : trimmed;
+        last.raw = `${last.raw}\n${trimmed}`;
+      }
+      continue;
+    }
     const parts = trimmed.slice(pipeIdx + 1).split('|');
     const eventType = parts[0] ?? '';
-    const lineRef = parts[1] ?? '';
-    const message = parts.slice(2).join(' | ');
+    const rest = parts.slice(1);
+    // Some events (FATAL_ERROR, anonymous CODE_UNITs) have no [N] line ref segment.
+    // Only treat parts[1] as the lineRef if it actually looks like one.
+    let lineRef = '';
+    let message: string;
+    if (rest.length > 0 && LINE_REF_RE.test(rest[0])) {
+      lineRef = rest[0];
+      message = rest.slice(1).join(' | ');
+    } else {
+      message = rest.join(' | ');
+    }
     const nanoMatch = timestampField.match(/\((\d+)\)/);
-    entries.push({
+    const entry: LogEntry = {
       lineNumber: i + 1,
       timestamp: timestampField.split(' ')[0],
       timestampNanos: nanoMatch ? Number(nanoMatch[1]) : null,
@@ -73,7 +94,9 @@ export function parseLogs(raw: string): LogEntry[] {
       lineRef,
       message,
       raw: trimmed
-    });
+    };
+    entries.push(entry);
+    last = entry;
   }
   return entries;
 }

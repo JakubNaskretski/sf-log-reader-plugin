@@ -102,7 +102,13 @@ export class SfCliService {
       ['apex', 'get', 'log', '-i', logId, '--target-org', targetOrg, '--json'],
       { timeoutMs, note: `get log ${logId}` }
     );
-    return extractLogBody(json.result);
+    const body = extractLogBody(json.result);
+    // An ApexLog body is never empty; an empty string means the CLI returned an
+    // unexpected shape — fail loudly instead of saving a 0-byte log as a success.
+    if (!body) {
+      throw new SfCliError(`Empty log body returned for ${logId}`);
+    }
+    return body;
   }
 
   async listActiveUsers(targetOrg: string, timeoutMs?: number): Promise<UserRecord[]> {
@@ -118,22 +124,41 @@ export class SfCliService {
 
   private async runJson<T>(args: string[], options: RunOptions = {}): Promise<T> {
     const { stdout, stderr, code } = await this.run(args, options);
-    if (code !== 0 && !stdout) {
-      throw new SfCliError(`sf ${args.join(' ')} exited with code ${code}`, stderr);
+    // Failed to even launch the CLI (not installed / not on PATH).
+    if (/\bENOENT\b/.test(stderr) || /spawn sf\b/i.test(stderr)) {
+      throw new SfCliError('Salesforce CLI (sf) not found on PATH. Install it and reload VS Code.', stderr);
     }
+    const trimmed = stdout.trim();
+    if (!trimmed) {
+      throw new SfCliError(`sf ${args.join(' ')} produced no output (exit ${code})`, stderr);
+    }
+    let parsed: unknown;
     try {
-      return JSON.parse(stdout) as T;
+      parsed = JSON.parse(trimmed);
     } catch (err) {
       throw new SfCliError(`Failed to parse JSON from sf ${args.join(' ')}`, stderr, err);
     }
+    // `sf --json` writes an error envelope ({status!=0, message/name}) to stdout even
+    // on failure — surface it instead of returning it as a success result.
+    const env = parsed as { status?: number; message?: unknown; name?: unknown };
+    if (env && typeof env.status === 'number' && env.status !== 0) {
+      const msg = (typeof env.message === 'string' && env.message) || (typeof env.name === 'string' && env.name) || `sf ${args.join(' ')} failed (status ${env.status})`;
+      throw new SfCliError(String(msg), stderr);
+    }
+    if (code !== 0 && (!env || env.status === undefined)) {
+      throw new SfCliError(`sf ${args.join(' ')} exited with code ${code}`, stderr);
+    }
+    return parsed as T;
   }
 
   private run(args: string[], options: RunOptions = {}): Promise<RunResult> {
     return new Promise(resolve => {
       const startedAt = Date.now();
       const timeoutMs = options.timeoutMs ?? this.defaultTimeoutMs;
-      let stdout = '';
-      let stderr = '';
+      // Collect raw Buffers and decode once, so multi-byte UTF-8 sequences split
+      // across stream chunks (common in large logs) aren't corrupted.
+      const stdoutChunks: Buffer[] = [];
+      const stderrChunks: Buffer[] = [];
       let settled = false;
 
       const child = spawn('sf', args, { shell: false });
@@ -141,6 +166,8 @@ export class SfCliService {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        const stdout = Buffer.concat(stdoutChunks).toString('utf8');
+        const stderr = Buffer.concat(stderrChunks).toString('utf8');
         const durationMs = Date.now() - startedAt;
         this.trail.record({
           startedAt,
@@ -160,10 +187,10 @@ export class SfCliService {
         finish(-1, true);
       }, timeoutMs);
 
-      child.stdout.on('data', chunk => { stdout += chunk.toString(); });
-      child.stderr.on('data', chunk => { stderr += chunk.toString(); });
+      child.stdout.on('data', chunk => { stdoutChunks.push(Buffer.from(chunk)); });
+      child.stderr.on('data', chunk => { stderrChunks.push(Buffer.from(chunk)); });
       child.on('error', err => {
-        stderr += `\n${(err as Error).message}`;
+        stderrChunks.push(Buffer.from(`\n${(err as Error).message}`));
         finish(-1, false);
       });
       child.on('close', code => finish(code ?? -1, false));
@@ -188,19 +215,21 @@ function normalizeLogRecord(raw: Record<string, unknown>): ApexLogRecord {
   };
 }
 
-function extractLogBody(result: unknown): string {
+/**
+ * Pull the log text out of `sf apex get log --json`'s `result`, which can be a
+ * string, an array of strings, or an array/object of `{ log }` — and on the
+ * Tooling-API-backed path, PascalCase `{ Log }`. Exported for tests.
+ */
+export function extractLogBody(result: unknown): string {
+  const pick = (o: Record<string, unknown>): string => String(o['log'] ?? o['Log'] ?? '');
   if (typeof result === 'string') return result;
   if (Array.isArray(result)) {
     if (result.length === 0) return '';
     const first = result[0];
     if (typeof first === 'string') return first;
-    if (first && typeof first === 'object' && 'log' in first) {
-      return String((first as { log?: unknown }).log ?? '');
-    }
+    if (first && typeof first === 'object') return pick(first as Record<string, unknown>);
   }
-  if (result && typeof result === 'object' && 'log' in (result as object)) {
-    return String((result as { log?: unknown }).log ?? '');
-  }
+  if (result && typeof result === 'object') return pick(result as Record<string, unknown>);
   return '';
 }
 
