@@ -3,6 +3,10 @@
 All notable changes to the SF Log Reader extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.4.3
+
+- Add a branded extension icon — shown on the Marketplace listing and the editor panel.
+
 ## 0.4.2
 
 - Internal packaging and tooling cleanup. No functional changes.

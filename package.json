@@ -2,8 +2,9 @@
   "name": "sf-log-reader",
   "displayName": "SF Log Reader",
   "description": "Browse, fetch, and filter Salesforce debug logs from any authenticated org, surfaced in a bottom-panel webview.",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "publisher": "Skrety",
+  "icon": "plugin-icon.png",
   "license": "MIT",
   "galleryBanner": {
     "color": "#1e1e2e",
@@ -32,7 +33,7 @@
         {
           "id": "sf-log-reader-panel",
           "title": "SF Log Reader",
-          "icon": "$(output)"
+          "icon": "media/activitybar-icon.svg"
         }
       ]
     },
