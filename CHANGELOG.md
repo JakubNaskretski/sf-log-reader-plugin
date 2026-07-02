@@ -3,7 +3,7 @@
 All notable changes to the SF Log Reader extension are documented here.
 This file starts at the current release; earlier history predates it.
 
-## Unreleased
+## 0.5.0
 
 - **Much faster fetch.** Log lists and bodies now download over the Salesforce
   REST API directly (one cached session per org) instead of spawning an `sf`
