@@ -83,6 +83,21 @@ describe('SfRestService.fetchLogBody', () => {
     expect(calls[1].headers.Authorization).toBe('Bearer fresh');
   });
 
+  it('refreshes the session only once when concurrent calls 401 together', async () => {
+    // Both workers hit 401 with the stale token, but only the first should
+    // invalidate — the second must reuse the sibling's refreshed session.
+    const { service, sessionCount } = makeService(
+      [fail(401), fail(401), ok('a'), ok('b')],
+      [conn({ accessToken: 'expired' }), conn({ accessToken: 'fresh' })]
+    );
+    const [a, b] = await Promise.all([
+      service.fetchLogBody('u', '07L1'),
+      service.fetchLogBody('u', '07L2')
+    ]);
+    expect([a, b].sort()).toEqual(['a', 'b']);
+    expect(sessionCount()).toBe(2);
+  });
+
   it('throws on repeated 401 without looping', async () => {
     const { service } = makeService([fail(401), fail(401)], [conn(), conn()]);
     await expect(service.fetchLogBody('u', '07L1')).rejects.toThrow(/HTTP 401/);

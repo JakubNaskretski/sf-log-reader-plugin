@@ -106,7 +106,7 @@ export class SfRestService {
     return body;
   }
 
-  private getConnection(username: string, timeoutMs?: number): Promise<OrgConnection> {
+  private getEntry(username: string, timeoutMs?: number): CacheEntry {
     let entry = this.connections.get(username);
     if (!entry) {
       // Cache the promise (not the value) so concurrent workers at batch start
@@ -124,16 +124,22 @@ export class SfRestService {
       this.connections.set(username, created);
       entry = created;
     }
-    return entry.promise;
+    return entry;
   }
 
   private async request(username: string, urlOf: (conn: OrgConnection) => string, timeoutMs?: number): Promise<string> {
-    let conn = await this.getConnection(username, timeoutMs);
+    const entry = this.getEntry(username, timeoutMs);
+    let conn = await entry.promise;
     let res = await this.doGet(urlOf(conn), conn.accessToken, timeoutMs);
     if (res.status === 401) {
-      // Session expired — refresh the token once via the CLI and retry.
-      this.invalidate(username);
-      conn = await this.getConnection(username, timeoutMs);
+      // Session expired — refresh the token once via the CLI and retry. Only
+      // drop the cached session if it is still the one that got the 401; in a
+      // concurrent 401 wave a sibling worker may have refreshed it already,
+      // and re-invalidating would spawn one `sf org display` per worker.
+      if (this.connections.get(username) === entry) {
+        this.connections.delete(username);
+      }
+      conn = await this.getEntry(username, timeoutMs).promise;
       res = await this.doGet(urlOf(conn), conn.accessToken, timeoutMs);
     }
     if (!res.ok) {

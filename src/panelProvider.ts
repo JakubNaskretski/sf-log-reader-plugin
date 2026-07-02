@@ -79,6 +79,8 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   private readonly savedLogs = new SavedLogsService();
   private fetchInFlight = false;
   private activeQueue: FetchQueue<ApexLogRecord> | null = null;
+  /** Username of the org the running fetch belongs to (null when idle). */
+  private activeFetchOrg: string | null = null;
   /** Records of the running fetch whose bodies haven't finished (success or fail) yet. */
   private readonly remainingFetch = new Map<string, ApexLogRecord>();
 
@@ -198,6 +200,7 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       }
       this.remainingFetch.clear();
       for (const rec of toDownload) this.remainingFetch.set(rec.Id, rec);
+      this.activeFetchOrg = org.username;
       await this.refreshStoredLogs();
 
       if (toDownload.length === 0) {
@@ -213,9 +216,10 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       const startedAt = Date.now();
 
       this.postStatus(`Downloading ${total} log${total === 1 ? '' : 's'} (${concurrency} parallel)…`);
-      // Re-read the filter at patch time — the user may change it mid-fetch,
-      // and a patch must not push rows into a list that now excludes them.
+      // Re-read org and filter at patch time — the user may change either
+      // mid-fetch, and a patch must not push rows into a list that excludes them.
       const patchVisible = (rec: ApexLogRecord): boolean => {
+        if (this.orgStore.getOrg() !== org.username) return false;
         const current = this.orgStore.getUser(org.username);
         return !current || rec.LogUserId === current;
       };
@@ -253,13 +257,16 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       }
       this.postStatus(`Fetched ${saved} new · ${cached} already stored · ${failures.length} error${failures.length === 1 ? '' : 's'}`);
       await this.refreshStoredLogs();
-      await this.checkStorage(store, orgAlias, maxStorageMB);
     } finally {
       this.fetchInFlight = false;
       this.activeQueue = null;
+      this.activeFetchOrg = null;
       this.remainingFetch.clear();
       this.post({ type: 'fetchState', running: false });
     }
+    // After the lock is released — checkStorage awaits a notification toast that
+    // only resolves on user interaction, and must not keep Fetch disabled.
+    await this.checkStorage(store, orgAlias, maxStorageMB);
   }
 
   /**
@@ -339,12 +346,15 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       }))
     );
     // While a fetch is running, keep its not-yet-downloaded logs visible as
-    // pending rows (a manual refresh must not make them vanish mid-download).
-    const storedIds = new Set(vm.map(v => v.id));
-    for (const rec of this.remainingFetch.values()) {
-      if (storedIds.has(rec.Id)) continue;
-      if (userId && rec.LogUserId !== userId) continue;
-      vm.push(this.toViewModel(rec, { pending: true }));
+    // pending rows (a manual refresh must not make them vanish mid-download) —
+    // but only while the fetch's org is still the one being displayed.
+    if (this.activeFetchOrg === org.username) {
+      const storedIds = new Set(vm.map(v => v.id));
+      for (const rec of this.remainingFetch.values()) {
+        if (storedIds.has(rec.Id)) continue;
+        if (userId && rec.LogUserId !== userId) continue;
+        vm.push(this.toViewModel(rec, { pending: true }));
+      }
     }
     vm.sort((a, b) => (b.startTime ?? '').localeCompare(a.startTime ?? ''));
     this.post({ type: 'logs', logs: vm });
@@ -391,6 +401,9 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
           await this.loadOrgs();
         }
         this.postCommandTrail();
+        // The recreated webview defaults to "not fetching" — resync the button
+        // with any fetch still running from before the tab switch.
+        this.post({ type: 'fetchState', running: this.fetchInFlight });
         await this.refreshStoredLogs();
         return;
       case 'selectOrg':

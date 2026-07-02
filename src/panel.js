@@ -253,6 +253,7 @@
         if (log.pending) {
           // Body still downloading — ask the host to bump it to the front of
           // the queue; the logPatch handler requests it once it lands.
+          detailHeaderEl.innerHTML = '<span class="empty">Downloading…</span>';
           detailBodyEl.innerHTML = '<div class="empty">Downloading log…</div>';
           post({ type: 'prioritizeLog', logId: log.id });
         } else if (log.failed) {
@@ -564,6 +565,7 @@
         persistState();
         renderDetailHeader(msg.stats, msg.logId, false);
         if (msg.downloading) {
+          detailHeaderEl.innerHTML = '<span class="empty">Downloading…</span>';
           detailBodyEl.innerHTML = '<div class="empty">Downloading log…</div>';
         } else if (msg.error) {
           detailBodyEl.innerHTML = `<div class="empty">${escapeHtml(msg.error)}</div>`;
