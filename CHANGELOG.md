@@ -3,6 +3,25 @@
 All notable changes to the SF Log Reader extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.6.0
+
+- **Start Capturing.** A toolbar button ensures a debug TraceFlag for the
+  selected user on the org, so new logs actually get generated — no more manual
+  Setup trips. The optional `sfLogReader.autoTraceFlag` setting (off by
+  default) does this automatically before each fetch.
+- **User filter now applies on the org.** With a log user selected, the org
+  query filters server-side, so that user's logs are found even in busy orgs
+  where they would fall outside the newest-N window.
+- Very large logs cap what is sent to the panel (first 5,000 entries) with a
+  notice and a one-click "open the full log in an editor" escape hatch.
+- Switching orgs from the command palette no longer shows the previous org's
+  user list, and palette commands work before the panel has been opened.
+- The selected org is now shared with the other Skrety Salesforce extensions —
+  switch once, it applies everywhere.
+- Windows: the `sf` launcher is resolved directly instead of through the shell,
+  and "CLI not found" is no longer reported spuriously when CLI plugins print
+  warnings.
+
 ## 0.5.0
 
 - **Much faster fetch.** Log lists and bodies now download over the Salesforce

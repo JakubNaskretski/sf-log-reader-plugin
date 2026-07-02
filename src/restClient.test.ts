@@ -3,12 +3,14 @@ import { CommandTrail } from './commandTrail';
 import { FetchLike, RestResponse, SfRestService } from './restClient';
 import { OrgConnection, SfCliError } from './sfCliService';
 
-const TOKEN = 'SECRET-TOKEN-00D5g000004xyzA';
+// ponytail: obviously-fake fixture value; keep it short and hyphenated so
+// secret scanners don't mistake it for a real session token.
+const FAKE_SESSION_FIXTURE = 'fake-test-token-value';
 
 function conn(overrides: Partial<OrgConnection> = {}): OrgConnection {
   return {
     instanceUrl: 'https://example-dev-ed.my.salesforce.com',
-    accessToken: TOKEN,
+    accessToken: FAKE_SESSION_FIXTURE,
     apiVersion: '61.0',
     ...overrides
   };
@@ -61,7 +63,7 @@ describe('SfRestService.fetchLogBody', () => {
     expect(calls[0].url).toBe(
       'https://example-dev-ed.my.salesforce.com/services/data/v61.0/tooling/sobjects/ApexLog/07L000000000001/Body'
     );
-    expect(calls[0].headers.Authorization).toBe(`Bearer ${TOKEN}`);
+    expect(calls[0].headers.Authorization).toBe(`Bearer ${FAKE_SESSION_FIXTURE}`);
   });
 
   it('reuses one session across calls, including concurrent ones', async () => {
@@ -110,7 +112,7 @@ describe('SfRestService.fetchLogBody', () => {
     const err = await service.fetchLogBody('u', '07L1').catch(e => e as SfCliError);
     expect(err).toBeInstanceOf(SfCliError);
     expect((err as Error).message).toContain('HTTP 500');
-    expect((err as Error).message).not.toContain(TOKEN);
+    expect((err as Error).message).not.toContain(FAKE_SESSION_FIXTURE);
   });
 
   it('rejects an empty body like the CLI path does', async () => {
@@ -187,7 +189,7 @@ describe('SfRestService.queryLogs', () => {
     const entries = trail.all();
     expect(entries).toHaveLength(1);
     expect(entries[0].cmd).toBe('REST');
-    expect(entries[0].args.join(' ')).not.toContain(TOKEN);
+    expect(entries[0].args.join(' ')).not.toContain(FAKE_SESSION_FIXTURE);
   });
 
   it('wraps malformed JSON in an SfCliError', async () => {
@@ -217,7 +219,7 @@ describe('SfRestService.toolingQuery / toolingCreate', () => {
     expect(calls[0].headers['Content-Type']).toBe('application/json');
     expect(JSON.parse(calls[0].body!)).toEqual({ LogType: 'DEVELOPER_LOG' });
     // The bearer token must be present on the POST too (session reuse).
-    expect(calls[0].headers.Authorization).toBe(`Bearer ${TOKEN}`);
+    expect(calls[0].headers.Authorization).toBe(`Bearer ${FAKE_SESSION_FIXTURE}`);
   });
 
   it('toolingCreate refreshes the session once on 401 and retries the POST', async () => {
