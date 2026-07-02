@@ -174,6 +174,19 @@ export function getPanelHtml(webview: vscode.Webview, extensionUri: vscode.Uri, 
     }
     .log-row .row-status-success { color: var(--vscode-testing-iconPassed, #2ea043); }
     .log-row .row-status-failed { color: var(--vscode-testing-iconFailed, #f85149); }
+    .log-row.pending .row-body { opacity: 0.55; }
+    .log-row .row-pending { color: var(--vscode-charts-blue, #3794ff); }
+    .log-row .row-failed { color: var(--vscode-testing-iconFailed, #f85149); }
+    .show-more {
+      display: block;
+      margin: 8px;
+      padding: 4px 10px;
+      background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
+      color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground));
+      border: 1px solid var(--vscode-button-border, transparent);
+      font-size: 11px;
+      cursor: pointer;
+    }
     .log-detail {
       flex: 1 1 auto;
       display: flex;
@@ -379,7 +392,7 @@ export function getPanelHtml(webview: vscode.Webview, extensionUri: vscode.Uri, 
   <div class="trail collapsed" id="trail">
     <div class="trail-header" id="trail-header">
       <span class="twist">&#x25bc;</span>
-      <span>SF CLI Command Log</span>
+      <span>SF Command Log</span>
       <span class="count" id="trail-count">(0)</span>
       <button id="clear-trail">Clear</button>
     </div>

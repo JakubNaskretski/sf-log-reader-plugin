@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { CommandTrail } from './commandTrail';
-import { SfCliService } from './sfCliService';
+import { SfCliService, normalizeApiVersion } from './sfCliService';
+import { SfRestService } from './restClient';
 import { OrgStore } from './orgStore';
 import { LogReaderPanelProvider, migrateLegacyStorage } from './panelProvider';
 
@@ -8,8 +9,15 @@ export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel('SF Log Reader');
   const trail = new CommandTrail();
   const sf = new SfCliService(trail);
+  const rest = new SfRestService(sf, trail, undefined, () => {
+    // Honor sfLogReader.apiVersion only when the user set it explicitly —
+    // the package.json default should not shadow the org's own API version.
+    const inspected = vscode.workspace.getConfiguration('sfLogReader').inspect<string>('apiVersion');
+    const explicit = inspected?.workspaceFolderValue ?? inspected?.workspaceValue ?? inspected?.globalValue;
+    return explicit ? normalizeApiVersion(explicit) : undefined;
+  });
   const orgStore = new OrgStore(context.globalState);
-  const provider = new LogReaderPanelProvider(context, sf, orgStore, trail, output);
+  const provider = new LogReaderPanelProvider(context, sf, rest, orgStore, trail, output);
 
   migrateLegacyStorage(context).catch(err => {
     output.appendLine(`Legacy storage migration failed: ${(err as Error).message}`);

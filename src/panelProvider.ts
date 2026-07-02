@@ -4,7 +4,9 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import { CommandTrail, CommandTrailEntry } from './commandTrail';
+import { FetchQueue } from './fetchQueue';
 import { OrgStore } from './orgStore';
+import { SfRestService } from './restClient';
 import { ApexLogRecord, OrgInfo, SfCliError, SfCliService, UserRecord } from './sfCliService';
 import { LogStore, StoredLogMeta } from './logStore';
 import { generateNonce, getPanelHtml } from './panelHtml';
@@ -21,6 +23,7 @@ type InboundMessage =
   | { type: 'fetchLogs' }
   | { type: 'refreshLogs' }
   | { type: 'selectLog'; logId: string; userId: string }
+  | { type: 'prioritizeLog'; logId: string }
   | { type: 'openLogInEditor'; logId: string; userId: string }
   | { type: 'generateSummary'; logId: string; userId: string }
   | { type: 'keepLog'; logId: string; userId: string }
@@ -59,6 +62,10 @@ interface LogViewModel {
   request?: string;
   fetchedAt: string;
   hasSummary: boolean;
+  /** Body not stored locally yet — queued or in flight in the current fetch. */
+  pending?: boolean;
+  /** Body download failed during the current fetch. */
+  failed?: boolean;
 }
 
 export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
@@ -70,10 +77,15 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   private logsFromOrg: ApexLogRecord[] = [];
   private externalLog: { sourcePath: string; body: string } | null = null;
   private readonly savedLogs = new SavedLogsService();
+  private fetchInFlight = false;
+  private activeQueue: FetchQueue<ApexLogRecord> | null = null;
+  /** Records of the running fetch whose bodies haven't finished (success or fail) yet. */
+  private readonly remainingFetch = new Map<string, ApexLogRecord>();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly sf: SfCliService,
+    private readonly rest: SfRestService,
     private readonly orgStore: OrgStore,
     private readonly trail: CommandTrail,
     private readonly output: vscode.OutputChannel
@@ -136,6 +148,10 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   }
 
   async fetchLatest(): Promise<void> {
+    if (this.fetchInFlight) {
+      this.postStatus('A fetch is already running — new logs appear as they arrive.');
+      return;
+    }
     const org = this.requireOrg();
     if (!org) return;
     const store = this.requireLogStore();
@@ -147,53 +163,152 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     const timeoutMs = config.get<number>('commandTimeoutMs', 60_000);
     const orgAlias = org.alias ?? org.username;
 
-    this.postStatus(`Listing latest ${limit} logs from ${orgAlias}…`);
-    let records: ApexLogRecord[];
+    this.fetchInFlight = true;
+    this.post({ type: 'fetchState', running: true });
     try {
-      records = await this.sf.listLogs(org.username, limit, timeoutMs);
-      this.logsFromOrg = records;
-    } catch (err) {
-      this.reportCliError('list logs', err);
-      return;
-    }
-
-    const userId = this.orgStore.getUser(org.username);
-    const filtered = userId ? records.filter(r => r.LogUserId === userId) : records;
-    if (filtered.length === 0) {
-      this.postStatus('No matching logs to fetch.');
-      return;
-    }
-
-    const total = filtered.length;
-    let completed = 0;
-    let saved = 0;
-    let skipped = 0;
-    const failures: Array<{ id: string; error: string }> = [];
-
-    this.postStatus(`Fetching ${total} log${total === 1 ? '' : 's'} (${concurrency} parallel)…`);
-    await runWithConcurrency(filtered, concurrency, async rec => {
+      this.postStatus(`Listing latest ${limit} logs from ${orgAlias}…`);
+      let records: ApexLogRecord[];
       try {
-        const owner = rec.LogUserId ?? 'unknown';
-        if (await store.exists(orgAlias, owner, rec.Id)) {
-          skipped += 1;
+        records = await this.listLogsFast(org.username, limit, timeoutMs);
+        this.logsFromOrg = records;
+      } catch (err) {
+        this.reportCliError('list logs', err);
+        return;
+      }
+
+      const userId = this.orgStore.getUser(org.username);
+      const filtered = userId ? records.filter(r => r.LogUserId === userId) : records;
+      if (filtered.length === 0) {
+        this.postStatus('No matching logs to fetch.');
+        return;
+      }
+
+      // Partition into already-stored and to-download up front, then show the
+      // full list immediately — newest logs render at the top as pending rows
+      // while their bodies stream in (the query is StartTime DESC, and the
+      // queue preserves that order, so the top of the list fills in first).
+      const toDownload: ApexLogRecord[] = [];
+      let cached = 0;
+      for (const rec of filtered) {
+        if (await store.exists(orgAlias, rec.LogUserId ?? 'unknown', rec.Id)) {
+          cached += 1;
         } else {
-          const body = await this.sf.getLogBody(org.username, rec.Id, timeoutMs);
-          const result = await store.save(orgAlias, rec, body, org.username);
-          if (result.wrote) saved += 1; else skipped += 1;
+          toDownload.push(rec);
         }
+      }
+      this.remainingFetch.clear();
+      for (const rec of toDownload) this.remainingFetch.set(rec.Id, rec);
+      await this.refreshStoredLogs();
+
+      if (toDownload.length === 0) {
+        this.postStatus(`All ${filtered.length} matching logs already stored locally.`);
+        return;
+      }
+
+      const total = toDownload.length;
+      let completed = 0;
+      let saved = 0;
+      let viaRest = 0;
+      const failures: Array<{ id: string; error: string }> = [];
+      const startedAt = Date.now();
+
+      this.postStatus(`Downloading ${total} log${total === 1 ? '' : 's'} (${concurrency} parallel)…`);
+      // Re-read the filter at patch time — the user may change it mid-fetch,
+      // and a patch must not push rows into a list that now excludes them.
+      const patchVisible = (rec: ApexLogRecord): boolean => {
+        const current = this.orgStore.getUser(org.username);
+        return !current || rec.LogUserId === current;
+      };
+      const queue = new FetchQueue(toDownload, rec => rec.Id);
+      this.activeQueue = queue;
+      await queue.run(concurrency, async rec => {
+        try {
+          const { body, via } = await this.downloadBody(org.username, rec.Id, timeoutMs);
+          if (via === 'rest') viaRest += 1;
+          const result = await store.save(orgAlias, rec, body, org.username);
+          if (result.wrote) saved += 1;
+          if (patchVisible(rec)) this.post({ type: 'logPatch', log: this.toViewModel(rec) });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          failures.push({ id: rec.Id, error: message });
+          this.output.appendLine(`[fetch] ${rec.Id} failed: ${message}`);
+          if (patchVisible(rec)) this.post({ type: 'logPatch', log: this.toViewModel(rec, { failed: true }) });
+        } finally {
+          this.remainingFetch.delete(rec.Id);
+          completed += 1;
+          this.postStatus(`Downloading ${completed}/${total} · ${saved} new · ${cached} cached${failures.length ? ` · ${failures.length} error${failures.length === 1 ? '' : 's'}` : ''}`);
+        }
+      });
+
+      if (viaRest > 0) {
+        this.trail.record({
+          startedAt,
+          durationMs: Date.now() - startedAt,
+          cmd: 'REST',
+          args: ['GET', `ApexLog/<id>/Body ×${viaRest}`],
+          exitCode: failures.length ? 1 : 0,
+          ok: failures.length === 0,
+          note: `download ${total} log bodies (${viaRest} via REST, ${total - viaRest} via CLI)`
+        });
+      }
+      this.postStatus(`Fetched ${saved} new · ${cached} already stored · ${failures.length} error${failures.length === 1 ? '' : 's'}`);
+      await this.refreshStoredLogs();
+      await this.checkStorage(store, orgAlias, maxStorageMB);
+    } finally {
+      this.fetchInFlight = false;
+      this.activeQueue = null;
+      this.remainingFetch.clear();
+      this.post({ type: 'fetchState', running: false });
+    }
+  }
+
+  /**
+   * List log headers via the Tooling REST API when a session is available —
+   * after the first fetch the token is cached, making this a single HTTP GET
+   * instead of a ~1-3s CLI process — falling back to the CLI on any failure.
+   */
+  private async listLogsFast(username: string, limit: number, timeoutMs: number): Promise<ApexLogRecord[]> {
+    if (this.rest.available()) {
+      this.rest.resetIfFailed(username);
+      try {
+        return await this.rest.queryLogs(username, limit, timeoutMs);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        failures.push({ id: rec.Id, error: message });
-        this.output.appendLine(`[fetch] ${rec.Id} failed: ${message}`);
-      } finally {
-        completed += 1;
-        this.postStatus(`Fetching ${completed}/${total} · ${saved} new · ${skipped} skipped${failures.length ? ` · ${failures.length} error${failures.length === 1 ? '' : 's'}` : ''}`);
+        this.output.appendLine(`[fetch] REST list failed, falling back to CLI: ${message}`);
       }
-    });
+    }
+    return this.sf.listLogs(username, limit, timeoutMs);
+  }
 
-    this.postStatus(`Fetched ${saved} new · skipped ${skipped} existing · ${failures.length} error${failures.length === 1 ? '' : 's'}`);
-    await this.refreshStoredLogs();
-    await this.checkStorage(store, orgAlias, maxStorageMB);
+  /** Download one log body — REST first (no process spawn), CLI as fallback. */
+  private async downloadBody(username: string, logId: string, timeoutMs: number): Promise<{ body: string; via: 'rest' | 'cli' }> {
+    if (this.rest.available()) {
+      try {
+        return { body: await this.rest.fetchLogBody(username, logId, timeoutMs), via: 'rest' };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.output.appendLine(`[fetch] REST body failed for ${logId}, falling back to CLI: ${message}`);
+      }
+    }
+    return { body: await this.sf.getLogBody(username, logId, timeoutMs), via: 'cli' };
+  }
+
+  private toViewModel(rec: ApexLogRecord, flags: { pending?: boolean; failed?: boolean } = {}): LogViewModel {
+    return {
+      id: rec.Id,
+      userId: rec.LogUserId ?? 'unknown',
+      userName: rec.LogUserName,
+      startTime: rec.StartTime,
+      durationMs: rec.DurationMilliseconds,
+      logLength: rec.LogLength,
+      status: rec.Status,
+      operation: rec.Operation,
+      application: rec.Application,
+      request: rec.Request,
+      fetchedAt: new Date().toISOString(),
+      hasSummary: false,
+      ...flags
+    };
   }
 
   async refreshStoredLogs(): Promise<void> {
@@ -223,6 +338,14 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
         hasSummary: await store.summaryExists(orgAlias, m.LogUserId ?? 'unknown', m.Id)
       }))
     );
+    // While a fetch is running, keep its not-yet-downloaded logs visible as
+    // pending rows (a manual refresh must not make them vanish mid-download).
+    const storedIds = new Set(vm.map(v => v.id));
+    for (const rec of this.remainingFetch.values()) {
+      if (storedIds.has(rec.Id)) continue;
+      if (userId && rec.LogUserId !== userId) continue;
+      vm.push(this.toViewModel(rec, { pending: true }));
+    }
     vm.sort((a, b) => (b.startTime ?? '').localeCompare(a.startTime ?? ''));
     this.post({ type: 'logs', logs: vm });
     this.postUsers(metas);
@@ -301,6 +424,10 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       case 'selectLog':
         await this.sendLogBody(message.logId, message.userId);
         return;
+      case 'prioritizeLog':
+        // User clicked a pending row — bump its body to the front of the queue.
+        this.activeQueue?.prioritize(message.logId);
+        return;
       case 'openLogInEditor':
         await this.openLogInEditor(message.logId, message.userId);
         return;
@@ -345,12 +472,20 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     const orgAlias = org.alias ?? org.username;
     const body = await store.readBody(orgAlias, userId, logId);
     if (body === undefined) {
-      this.post({ type: 'logBody', logId, body: '', entries: [], stats: null, error: 'Not found locally.' });
+      if (this.activeQueue?.isOutstanding(logId)) {
+        // Still downloading — bump it and let the webview wait for its logPatch.
+        this.activeQueue.prioritize(logId);
+        this.post({ type: 'logBody', logId, entries: [], stats: null, downloading: true });
+        return;
+      }
+      this.post({ type: 'logBody', logId, entries: [], stats: null, error: 'Not found locally.' });
       return;
     }
     const entries = parseLogs(body);
     const stats = summarize(entries);
-    this.post({ type: 'logBody', logId, body, entries, stats });
+    // The webview renders parsed entries only — the raw body stays out of the
+    // message; serializing multi-MB strings across the bridge is pure overhead.
+    this.post({ type: 'logBody', logId, entries, stats });
   }
 
   async keepLog(logId: string, userId: string): Promise<void> {
@@ -870,17 +1005,4 @@ async function pruneEmptyDirs(dir: string): Promise<void> {
   } catch {
     // not empty or already gone
   }
-}
-
-async function runWithConcurrency<T>(items: T[], concurrency: number, worker: (item: T, index: number) => Promise<void>): Promise<void> {
-  const width = Math.min(concurrency, items.length);
-  let next = 0;
-  const runners = Array.from({ length: width }, async () => {
-    while (true) {
-      const i = next++;
-      if (i >= items.length) return;
-      await worker(items[i], i);
-    }
-  });
-  await Promise.all(runners);
 }

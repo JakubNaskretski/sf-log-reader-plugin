@@ -38,6 +38,13 @@ export class SfCliError extends Error {
   }
 }
 
+/** Credentials for direct REST calls. Held in memory only — never logged or persisted. */
+export interface OrgConnection {
+  instanceUrl: string;
+  accessToken: string;
+  apiVersion: string;
+}
+
 interface RunOptions {
   timeoutMs?: number;
   note?: string;
@@ -81,15 +88,12 @@ export class SfCliService {
   }
 
   async listLogs(targetOrg: string, limit: number, timeoutMs?: number): Promise<ApexLogRecord[]> {
-    const safeLimit = Math.max(1, Math.min(200, Math.floor(limit)));
-    const query =
-      `SELECT Id, Application, DurationMilliseconds, Location, LogLength, LogUserId, LogUser.Name, ` +
-      `Operation, Request, StartTime, Status FROM ApexLog ORDER BY StartTime DESC LIMIT ${safeLimit}`;
+    const query = apexLogQuery(limit);
     const json = await this.runJson<{
       result: { records?: Array<Record<string, unknown>> };
     }>(
       ['data', 'query', '--query', query, '--use-tooling-api', '--target-org', targetOrg, '--json'],
-      { timeoutMs, note: `list ${safeLimit} logs` }
+      { timeoutMs, note: 'list logs' }
     );
     const records = json.result?.records ?? [];
     return records.map(r => normalizeLogRecord(r));
@@ -111,6 +115,27 @@ export class SfCliService {
     return body;
   }
 
+  /**
+   * Resolve the org's live session for direct REST calls. The token is returned
+   * to the caller only — it must never reach the command trail, output channel,
+   * error messages, or disk.
+   */
+  async orgDisplay(targetOrg: string, timeoutMs?: number): Promise<OrgConnection> {
+    const json = await this.runJson<{
+      result?: { accessToken?: unknown; instanceUrl?: unknown; apiVersion?: unknown };
+    }>(
+      ['org', 'display', '--target-org', targetOrg, '--json'],
+      { timeoutMs, note: 'resolve REST session' }
+    );
+    const r = json.result ?? {};
+    const accessToken = typeof r.accessToken === 'string' ? r.accessToken : '';
+    const instanceUrl = typeof r.instanceUrl === 'string' ? r.instanceUrl.replace(/\/+$/, '') : '';
+    if (!accessToken || !instanceUrl) {
+      throw new SfCliError(`sf org display returned no usable session for ${targetOrg}`);
+    }
+    return { accessToken, instanceUrl, apiVersion: normalizeApiVersion(r.apiVersion) };
+  }
+
   async listActiveUsers(targetOrg: string, timeoutMs?: number): Promise<UserRecord[]> {
     const query = `SELECT Id, Name, Username FROM User WHERE IsActive = true ORDER BY Name LIMIT 200`;
     const json = await this.runJson<{
@@ -124,8 +149,9 @@ export class SfCliService {
 
   private async runJson<T>(args: string[], options: RunOptions = {}): Promise<T> {
     const { stdout, stderr, code } = await this.run(args, options);
-    // Failed to even launch the CLI (not installed / not on PATH).
-    if (/\bENOENT\b/.test(stderr) || /spawn sf\b/i.test(stderr)) {
+    // Failed to even launch the CLI (not installed / not on PATH). The last
+    // pattern is cmd.exe's phrasing — on Windows we launch through the shell.
+    if (/\bENOENT\b/.test(stderr) || /spawn sf\b/i.test(stderr) || /is not recognized as an internal or external command/i.test(stderr)) {
       throw new SfCliError('Salesforce CLI (sf) not found on PATH. Install it and reload VS Code.', stderr);
     }
     const trimmed = stdout.trim();
@@ -161,7 +187,13 @@ export class SfCliService {
       const stderrChunks: Buffer[] = [];
       let settled = false;
 
-      const child = spawn('sf', args, { shell: false });
+      // On Windows `sf` is a .cmd shim, which Node refuses to spawn directly
+      // (EINVAL since the CVE-2024-27980 hardening) — go through the shell there,
+      // quoting each argument ourselves because spawn joins them verbatim.
+      const isWindows = process.platform === 'win32';
+      const child = isWindows
+        ? spawn('sf', args.map(quoteForCmd), { shell: true })
+        : spawn('sf', args, { shell: false });
       const finish = (code: number, killed: boolean) => {
         if (settled) return;
         settled = true;
@@ -198,7 +230,34 @@ export class SfCliService {
   }
 }
 
-function normalizeLogRecord(raw: Record<string, unknown>): ApexLogRecord {
+/** SOQL for the newest ApexLog headers — shared by the CLI and REST list paths. */
+export function apexLogQuery(limit: number): string {
+  const safeLimit = Math.max(1, Math.min(200, Math.floor(limit)));
+  return (
+    `SELECT Id, Application, DurationMilliseconds, Location, LogLength, LogUserId, LogUser.Name, ` +
+    `Operation, Request, StartTime, Status FROM ApexLog ORDER BY StartTime DESC LIMIT ${safeLimit}`
+  );
+}
+
+/**
+ * Quote one argument for cmd.exe (`shell: true` on Windows joins args with
+ * spaces, unquoted). Simple tokens pass through; anything else is wrapped in
+ * double quotes with embedded quotes doubled. Exported for tests.
+ */
+export function quoteForCmd(arg: string): string {
+  if (/^[A-Za-z0-9_\-.:=@\/,]+$/.test(arg)) return arg;
+  return '"' + arg.replace(/"/g, '""') + '"';
+}
+
+export function normalizeApiVersion(value: unknown): string {
+  if (typeof value === 'string' && /^\d+(\.\d+)?$/.test(value)) {
+    return value.includes('.') ? value : `${value}.0`;
+  }
+  // Old enough that any current org supports it, new enough for the Tooling API.
+  return '61.0';
+}
+
+export function normalizeLogRecord(raw: Record<string, unknown>): ApexLogRecord {
   const logUser = (raw['LogUser'] ?? {}) as Record<string, unknown>;
   return {
     Id: String(raw['Id'] ?? ''),
