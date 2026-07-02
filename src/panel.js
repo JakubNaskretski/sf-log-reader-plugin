@@ -32,6 +32,11 @@
   // VS Code tears the webview down whenever the bottom-pane tab is switched away.
   // Persist enough state via vscode.setState/getState that re-show is instant —
   // the selected log + parsed entries re-render before the host responds.
+  // Cap how many entries are rendered per pass and persisted — huge logs made
+  // every keystroke rebuild (and re-serialize) hundreds of thousands of rows.
+  const RENDER_CHUNK = 2000;
+  const MAX_PERSIST_ENTRIES = 20000;
+
   const saved = vscode.getState() || {};
   const state = {
     orgs: [],
@@ -47,14 +52,18 @@
     search: saved.search ?? '',
     trail: [],
     external: null,
-    selected: new Set()
+    selected: new Set(),
+    fetchRunning: false,
+    renderLimit: RENDER_CHUNK
   };
 
   function persistState() {
     vscode.setState({
       activeLogId: state.activeLogId,
       activeUserId: state.activeUserId,
-      entries: state.entries,
+      // Very large logs are not persisted — the host re-sends the body on
+      // restore (the 'logs' handler re-requests when entries are empty).
+      entries: state.entries.length <= MAX_PERSIST_ENTRIES ? state.entries : [],
       stats: state.stats,
       filters: Array.from(state.filters),
       search: state.search
@@ -69,16 +78,24 @@
     cb.addEventListener('change', () => {
       if (cb.checked) state.filters.add(cb.dataset.cat);
       else state.filters.delete(cb.dataset.cat);
+      state.renderLimit = RENDER_CHUNK;
       persistState();
       renderEntries();
     });
   });
 
   if (state.search) searchEl.value = state.search;
+  let searchTimer = null;
   searchEl.addEventListener('input', () => {
     state.search = searchEl.value.toLowerCase();
-    persistState();
-    renderEntries();
+    // Debounced: rebuilding the entry DOM and persisting state on every
+    // keystroke crawls on big logs.
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      state.renderLimit = RENDER_CHUNK;
+      persistState();
+      renderEntries();
+    }, 150);
   });
 
   orgSelect.addEventListener('change', () => {
@@ -98,7 +115,7 @@
   clearLogsBtn.addEventListener('click', () => post({ type: 'deleteAllLogs' }));
 
   selectAllEl.addEventListener('change', () => {
-    state.selected = new Set(selectAllEl.checked ? state.logs.map(l => l.id) : []);
+    state.selected = new Set(selectAllEl.checked ? selectableLogs().map(l => l.id) : []);
     renderLogs();
     renderSelection();
   });
@@ -142,19 +159,27 @@
     post({ type: 'clearCommandTrail' });
   });
 
+  function selectableLogs() {
+    return state.logs.filter(l => !l.pending && !l.failed);
+  }
+
+  function updateFetchButton() {
+    fetchBtn.disabled = state.orgs.length === 0 || state.fetchRunning;
+    fetchBtn.textContent = state.fetchRunning ? '⬇ Fetching…' : '⬇ Fetch';
+  }
+
   function renderOrgs() {
     orgSelect.innerHTML = '';
+    updateFetchButton();
     if (state.orgs.length === 0) {
       const opt = document.createElement('option');
       opt.value = '';
       opt.textContent = 'No authenticated orgs';
       orgSelect.appendChild(opt);
       orgSelect.disabled = true;
-      fetchBtn.disabled = true;
       return;
     }
     orgSelect.disabled = false;
-    fetchBtn.disabled = false;
     for (const org of state.orgs) {
       const opt = document.createElement('option');
       opt.value = org.username;
@@ -192,11 +217,14 @@
     for (const log of state.logs) {
       const row = document.createElement('div');
       row.className = 'log-row' + (log.id === state.activeLogId ? ' active' : '');
+      if (log.pending) row.classList.add('pending');
+      if (log.failed) row.classList.add('failed');
 
       const check = document.createElement('input');
       check.type = 'checkbox';
       check.className = 'row-check';
       check.checked = state.selected.has(log.id);
+      check.disabled = !!(log.pending || log.failed);
       check.addEventListener('click', e => e.stopPropagation());
       check.addEventListener('change', () => {
         if (check.checked) state.selected.add(log.id);
@@ -214,16 +242,29 @@
         state.activeUserId = log.userId;
         state.entries = [];
         state.stats = null;
+        state.renderLimit = RENDER_CHUNK;
         persistState();
         if (state.external) {
           state.external = null;
           externalBanner.classList.remove('visible');
         }
         renderLogs();
-        detailBodyEl.innerHTML = '<div class="empty">Loading…</div>';
-        post({ type: 'selectLog', logId: log.id, userId: log.userId });
+        renderDetailHeader(null);
+        if (log.pending) {
+          // Body still downloading — ask the host to bump it to the front of
+          // the queue; the logPatch handler requests it once it lands.
+          detailHeaderEl.innerHTML = '<span class="empty">Downloading…</span>';
+          detailBodyEl.innerHTML = '<div class="empty">Downloading log…</div>';
+          post({ type: 'prioritizeLog', logId: log.id });
+        } else if (log.failed) {
+          detailBodyEl.innerHTML = '<div class="empty">Download failed — run Fetch again to retry.</div>';
+        } else {
+          detailBodyEl.innerHTML = '<div class="empty">Loading…</div>';
+          post({ type: 'selectLog', logId: log.id, userId: log.userId });
+        }
       });
       row.addEventListener('dblclick', () => {
+        if (log.pending || log.failed) return;
         post({ type: 'openLogInEditor', logId: log.id, userId: log.userId });
       });
 
@@ -241,6 +282,17 @@
 
       const bot = document.createElement('div');
       bot.className = 'row-bot';
+      if (log.pending) {
+        const badge = document.createElement('span');
+        badge.className = 'row-pending';
+        badge.textContent = '⏳ downloading…';
+        bot.appendChild(badge);
+      } else if (log.failed) {
+        const badge = document.createElement('span');
+        badge.className = 'row-failed';
+        badge.textContent = '⚠ download failed';
+        bot.appendChild(badge);
+      }
       const op = document.createElement('span');
       op.textContent = (log.operation || '').slice(0, 32);
       const status = document.createElement('span');
@@ -270,8 +322,9 @@
     if (keepSelectedBtn.textContent === 'Saving…' && n === 0) {
       keepSelectedBtn.innerHTML = '\u{1F4BE} Keep selected';
     }
-    if (state.logs.length > 0) {
-      const allSelected = state.logs.every(l => state.selected.has(l.id));
+    const selectable = selectableLogs();
+    if (selectable.length > 0) {
+      const allSelected = selectable.every(l => state.selected.has(l.id));
       selectAllEl.checked = allSelected;
       selectAllEl.indeterminate = !allSelected && n > 0;
     } else {
@@ -343,10 +396,15 @@
       return;
     }
     const search = state.search;
+    const frag = document.createDocumentFragment();
     let shown = 0;
+    let matched = 0;
     for (const e of state.entries) {
       if (!state.filters.has(e.category)) continue;
       if (search && !e.message.toLowerCase().includes(search) && !e.eventType.toLowerCase().includes(search)) continue;
+      matched += 1;
+      // Past the render cap: keep counting matches for the button label only.
+      if (shown >= state.renderLimit) continue;
       const row = document.createElement('div');
       row.className = `log-entry cat-${e.category}`;
       if (search) row.classList.add('search-hit');
@@ -373,14 +431,26 @@
         msg.textContent = e.message;
         row.appendChild(msg);
       }
-      detailBodyEl.appendChild(row);
+      frag.appendChild(row);
       shown += 1;
     }
+    detailBodyEl.appendChild(frag);
     if (shown === 0) {
       const em = document.createElement('div');
       em.className = 'empty';
       em.textContent = 'All entries filtered out.';
       detailBodyEl.appendChild(em);
+      return;
+    }
+    if (matched > shown) {
+      const more = document.createElement('button');
+      more.className = 'show-more';
+      more.textContent = `Show ${Math.min(RENDER_CHUNK, matched - shown)} more (${matched - shown} hidden)`;
+      more.addEventListener('click', () => {
+        state.renderLimit += RENDER_CHUNK;
+        renderEntries();
+      });
+      detailBodyEl.appendChild(more);
     }
   }
 
@@ -491,13 +561,42 @@
         externalBanner.classList.remove('visible');
         state.entries = msg.entries || [];
         state.stats = msg.stats || null;
+        state.renderLimit = RENDER_CHUNK;
         persistState();
         renderDetailHeader(msg.stats, msg.logId, false);
-        if (msg.error) {
+        if (msg.downloading) {
+          detailHeaderEl.innerHTML = '<span class="empty">Downloading…</span>';
+          detailBodyEl.innerHTML = '<div class="empty">Downloading log…</div>';
+        } else if (msg.error) {
           detailBodyEl.innerHTML = `<div class="empty">${escapeHtml(msg.error)}</div>`;
         } else {
           renderEntries();
         }
+        break;
+      case 'logPatch': {
+        // One log in the running fetch changed state (downloaded or failed).
+        const patched = msg.log;
+        const idx = state.logs.findIndex(l => l.id === patched.id);
+        if (idx >= 0) {
+          state.logs[idx] = patched;
+        } else {
+          state.logs.push(patched);
+          state.logs.sort((a, b) => (b.startTime ?? '').localeCompare(a.startTime ?? ''));
+        }
+        renderLogs();
+        // If the user is waiting on this row, load it the moment it's ready.
+        if (patched.id === state.activeLogId && !patched.pending) {
+          if (patched.failed) {
+            detailBodyEl.innerHTML = '<div class="empty">Download failed — run Fetch again to retry.</div>';
+          } else {
+            post({ type: 'selectLog', logId: patched.id, userId: patched.userId });
+          }
+        }
+        break;
+      }
+      case 'fetchState':
+        state.fetchRunning = !!msg.running;
+        updateFetchButton();
         break;
       case 'status':
         setStatus(msg.text, msg.error);

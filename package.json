@@ -173,12 +173,12 @@
           "default": 60000,
           "minimum": 5000,
           "maximum": 600000,
-          "description": "Timeout in milliseconds for individual sf CLI invocations."
+          "description": "Timeout in milliseconds for individual sf CLI invocations and REST requests."
         },
         "sfLogReader.apiVersion": {
           "type": "string",
           "default": "60.0",
-          "description": "Salesforce API version (informational; used for any future Tooling API calls)."
+          "description": "Salesforce API version for direct Tooling API (REST) calls. Leave unset to use the org's default API version."
         }
       }
     }
