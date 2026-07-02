@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import { CommandTrail } from './commandTrail';
+import { resolveSfCommand } from './kit/sfCli';
 
 export interface OrgInfo {
   username: string;
@@ -54,12 +55,24 @@ interface RunResult {
   stdout: string;
   stderr: string;
   code: number;
+  /** True when the CLI could not be launched at all (spawn ENOENT). Set only
+   *  from the spawn `error` event — never inferred from stderr contents, which
+   *  sf plugins print ENOENT warnings into on a perfectly successful exit 0. */
+  notFound?: boolean;
 }
 
 export class SfCliService {
   private readonly defaultTimeoutMs = 60_000;
+  /** Resolved absolute `sf` launcher path (Windows shim) — computed once. */
+  private resolvedSf: string | undefined;
 
   constructor(private readonly trail: CommandTrail) {}
+
+  /** Cache the resolved `sf` launcher path so we pay the Windows lookup once. */
+  private sfCommand(): string {
+    if (this.resolvedSf === undefined) this.resolvedSf = resolveSfCommand();
+    return this.resolvedSf;
+  }
 
   async listOrgs(timeoutMs?: number): Promise<OrgInfo[]> {
     const result = await this.runJson<{
@@ -87,8 +100,8 @@ export class SfCliService {
     });
   }
 
-  async listLogs(targetOrg: string, limit: number, timeoutMs?: number): Promise<ApexLogRecord[]> {
-    const query = apexLogQuery(limit);
+  async listLogs(targetOrg: string, limit: number, timeoutMs?: number, userId?: string): Promise<ApexLogRecord[]> {
+    const query = apexLogQuery(limit, userId);
     const json = await this.runJson<{
       result: { records?: Array<Record<string, unknown>> };
     }>(
@@ -148,10 +161,14 @@ export class SfCliService {
   }
 
   private async runJson<T>(args: string[], options: RunOptions = {}): Promise<T> {
-    const { stdout, stderr, code } = await this.run(args, options);
-    // Failed to even launch the CLI (not installed / not on PATH). The last
-    // pattern is cmd.exe's phrasing — on Windows we launch through the shell.
-    if (/\bENOENT\b/.test(stderr) || /spawn sf\b/i.test(stderr) || /is not recognized as an internal or external command/i.test(stderr)) {
+    const { stdout, stderr, code, notFound } = await this.run(args, options);
+    // Failed to even launch the CLI (not installed / not on PATH). Inferred ONLY
+    // from a spawn ENOENT (notFound), never from stderr contents — sf plugins
+    // print ENOENT warnings on a valid exit 0, which the old stderr-substring
+    // check misfired on. The Windows shell path that made
+    // cmd.exe emit "is not recognized…" is gone too: we now resolve the real
+    // sf.cmd shim path and spawn it with shell:false (kit resolveSfCommand).
+    if (notFound) {
       throw new SfCliError('Salesforce CLI (sf) not found on PATH. Install it and reload VS Code.', stderr);
     }
     const trimmed = stdout.trim();
@@ -186,14 +203,15 @@ export class SfCliService {
       const stdoutChunks: Buffer[] = [];
       const stderrChunks: Buffer[] = [];
       let settled = false;
+      let notFound = false;
 
-      // On Windows `sf` is a .cmd shim, which Node refuses to spawn directly
-      // (EINVAL since the CVE-2024-27980 hardening) — go through the shell there,
-      // quoting each argument ourselves because spawn joins them verbatim.
-      const isWindows = process.platform === 'win32';
-      const child = isWindows
-        ? spawn('sf', args.map(quoteForCmd), { shell: true })
-        : spawn('sf', args, { shell: false });
+      // Resolve the sf launcher once (kit shim-resolution): on Windows the real
+      // launcher is `sf.cmd`/`sf.ps1`, which Node refuses to spawn as the bare
+      // name (EINVAL since the CVE-2024-27980 hardening). We spawn the resolved
+      // absolute path with shell:false — no shell, so args pass through as an
+      // argv array verbatim with NO cmd.exe quoting needed (retiring the old
+      // shell:true + quoteForCmd path and its `%`-expansion gap).
+      const child = spawn(this.sfCommand(), args, { shell: false });
       const finish = (code: number, killed: boolean) => {
         if (settled) return;
         settled = true;
@@ -207,11 +225,11 @@ export class SfCliService {
           cmd: 'sf',
           args,
           exitCode: code,
-          ok: !killed && code === 0,
+          ok: !killed && !notFound && code === 0,
           stderrSnippet: stderr ? truncate(stderr, 400) : undefined,
           note: killed ? `${options.note ?? ''} (timeout)`.trim() : options.note
         });
-        resolve({ stdout, stderr, code });
+        resolve({ stdout, stderr, code, notFound });
       };
 
       const timer = setTimeout(() => {
@@ -222,6 +240,9 @@ export class SfCliService {
       child.stdout.on('data', chunk => { stdoutChunks.push(Buffer.from(chunk)); });
       child.stderr.on('data', chunk => { stderrChunks.push(Buffer.from(chunk)); });
       child.on('error', err => {
+        // "sf not found" is inferred ONLY here, from a spawn ENOENT — never from
+        // stderr contents.
+        notFound = (err as NodeJS.ErrnoException).code === 'ENOENT';
         stderrChunks.push(Buffer.from(`\n${(err as Error).message}`));
         finish(-1, false);
       });
@@ -230,23 +251,31 @@ export class SfCliService {
   }
 }
 
-/** SOQL for the newest ApexLog headers — shared by the CLI and REST list paths. */
-export function apexLogQuery(limit: number): string {
-  const safeLimit = Math.max(1, Math.min(200, Math.floor(limit)));
-  return (
-    `SELECT Id, Application, DurationMilliseconds, Location, LogLength, LogUserId, LogUser.Name, ` +
-    `Operation, Request, StartTime, Status FROM ApexLog ORDER BY StartTime DESC LIMIT ${safeLimit}`
-  );
+/** A valid Salesforce record id (15 or 18 char, alphanumeric). Used to gate a
+ *  LogUserId before it enters a SOQL string that reaches a REST URL (and, on the
+ *  CLI path, the process argv). Exported for tests. */
+export const SF_ID_RE = /^[A-Za-z0-9]{15,18}$/;
+
+/** True when `id` is a syntactically valid Salesforce id (15/18 alphanumeric). */
+export function isValidSalesforceId(id: string | undefined | null): id is string {
+  return typeof id === 'string' && SF_ID_RE.test(id);
 }
 
 /**
- * Quote one argument for cmd.exe (`shell: true` on Windows joins args with
- * spaces, unquoted). Simple tokens pass through; anything else is wrapped in
- * double quotes with embedded quotes doubled. Exported for tests.
+ * SOQL for the newest ApexLog headers — shared by the CLI and REST list paths.
+ * When `userId` is a valid Salesforce id, the query is filtered server-side with
+ * `WHERE LogUserId = '<id>'` so busy orgs don't return top-N logs that all get
+ * client-filtered away. The id is validated (`SF_ID_RE`) before
+ * interpolation — it enters a REST URL and the CLI argv — and an invalid one is
+ * ignored (no WHERE clause) rather than trusted.
  */
-export function quoteForCmd(arg: string): string {
-  if (/^[A-Za-z0-9_\-.:=@\/,]+$/.test(arg)) return arg;
-  return '"' + arg.replace(/"/g, '""') + '"';
+export function apexLogQuery(limit: number, userId?: string): string {
+  const safeLimit = Math.max(1, Math.min(200, Math.floor(limit)));
+  const where = isValidSalesforceId(userId) ? ` WHERE LogUserId = '${userId}'` : '';
+  return (
+    `SELECT Id, Application, DurationMilliseconds, Location, LogLength, LogUserId, LogUser.Name, ` +
+    `Operation, Request, StartTime, Status FROM ApexLog${where} ORDER BY StartTime DESC LIMIT ${safeLimit}`
+  );
 }
 
 export function normalizeApiVersion(value: unknown): string {

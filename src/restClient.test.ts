@@ -25,13 +25,15 @@ function fail(status: number, body = ''): RestResponse {
 interface Call {
   url: string;
   headers: Record<string, string>;
+  method?: string;
+  body?: string;
 }
 
 function makeService(responses: Array<RestResponse | Error>, sessions: Array<OrgConnection | Error>) {
   const calls: Call[] = [];
   let sessionCalls = 0;
   const fetchFn: FetchLike = async (url, init) => {
-    calls.push({ url, headers: init.headers });
+    calls.push({ url, headers: init.headers, method: init.method, body: init.body });
     const next = responses.shift();
     if (!next) throw new Error('unexpected extra fetch call');
     if (next instanceof Error) throw next;
@@ -191,6 +193,47 @@ describe('SfRestService.queryLogs', () => {
   it('wraps malformed JSON in an SfCliError', async () => {
     const { service } = makeService([ok('<html>login page</html>')], [conn()]);
     await expect(service.queryLogs('u', 10)).rejects.toThrow(/parse/i);
+  });
+});
+
+describe('SfRestService.toolingQuery / toolingCreate', () => {
+  it('toolingQuery GETs the query endpoint and returns records', async () => {
+    const { service, calls } = makeService(
+      [ok(JSON.stringify({ records: [{ Id: '005000000000001' }] }))],
+      [conn()]
+    );
+    const rows = await service.toolingQuery<{ Id: string }>('u', 'SELECT Id FROM User');
+    expect(rows).toEqual([{ Id: '005000000000001' }]);
+    expect(calls[0].method).toBe('GET');
+    expect(calls[0].url).toContain('/tooling/query?q=SELECT');
+  });
+
+  it('toolingCreate POSTs a JSON body and returns the new id', async () => {
+    const { service, calls } = makeService([ok(JSON.stringify({ id: '7tf000000000001', success: true }))], [conn()]);
+    const id = await service.toolingCreate('u', 'TraceFlag', { LogType: 'DEVELOPER_LOG' });
+    expect(id).toBe('7tf000000000001');
+    expect(calls[0].method).toBe('POST');
+    expect(calls[0].url).toContain('/tooling/sobjects/TraceFlag');
+    expect(calls[0].headers['Content-Type']).toBe('application/json');
+    expect(JSON.parse(calls[0].body!)).toEqual({ LogType: 'DEVELOPER_LOG' });
+    // The bearer token must be present on the POST too (session reuse).
+    expect(calls[0].headers.Authorization).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it('toolingCreate refreshes the session once on 401 and retries the POST', async () => {
+    const { service, calls, sessionCount } = makeService(
+      [fail(401), ok(JSON.stringify({ id: 'newid' }))],
+      [conn({ accessToken: 'expired' }), conn({ accessToken: 'fresh' })]
+    );
+    const id = await service.toolingCreate('u', 'DebugLevel', { DeveloperName: 'X' });
+    expect(id).toBe('newid');
+    expect(sessionCount()).toBe(2);
+    expect(calls[1].headers.Authorization).toBe('Bearer fresh');
+  });
+
+  it('toolingCreate throws when the response carries no id', async () => {
+    const { service } = makeService([ok(JSON.stringify({ success: false, errors: ['nope'] }))], [conn()]);
+    await expect(service.toolingCreate('u', 'TraceFlag', {})).rejects.toThrow(/no id/);
   });
 });
 

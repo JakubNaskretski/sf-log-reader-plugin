@@ -13,7 +13,7 @@ export interface RestResponse {
 
 export type FetchLike = (
   url: string,
-  init: { method: string; headers: Record<string, string>; signal?: AbortSignal }
+  init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal }
 ) => Promise<RestResponse>;
 
 export interface SessionProvider {
@@ -64,13 +64,13 @@ export class SfRestService {
     this.connections.delete(username);
   }
 
-  async queryLogs(username: string, limit: number, timeoutMs?: number): Promise<ApexLogRecord[]> {
+  async queryLogs(username: string, limit: number, timeoutMs?: number, userId?: string): Promise<ApexLogRecord[]> {
     const startedAt = Date.now();
-    const soql = apexLogQuery(limit);
+    const soql = apexLogQuery(limit, userId);
     const raw = await this.request(
       username,
       conn => `${conn.instanceUrl}/services/data/v${conn.apiVersion}/tooling/query?q=${encodeURIComponent(soql)}`,
-      timeoutMs
+      { timeoutMs }
     );
     this.trail.record({
       startedAt,
@@ -97,7 +97,7 @@ export class SfRestService {
     const body = await this.request(
       username,
       conn => `${conn.instanceUrl}/services/data/v${conn.apiVersion}/tooling/sobjects/ApexLog/${encodeURIComponent(logId)}/Body`,
-      timeoutMs
+      { timeoutMs }
     );
     // Same contract as the CLI path: an ApexLog body is never legitimately empty.
     if (!body) {
@@ -127,10 +127,21 @@ export class SfRestService {
     return entry;
   }
 
-  private async request(username: string, urlOf: (conn: OrgConnection) => string, timeoutMs?: number): Promise<string> {
+  /**
+   * Issue a Tooling API request against the org, refreshing the cached session
+   * once on 401 (shared by GET/POST/PATCH). `urlOf` builds the URL from the
+   * resolved connection so the caller stays token-unaware. Options carry the
+   * HTTP method (default GET), an optional JSON body, and a per-request timeout.
+   */
+  private async request(
+    username: string,
+    urlOf: (conn: OrgConnection) => string,
+    opts: { method?: string; body?: unknown; timeoutMs?: number } = {}
+  ): Promise<string> {
+    const { method = 'GET', body, timeoutMs } = opts;
     const entry = this.getEntry(username, timeoutMs);
     let conn = await entry.promise;
-    let res = await this.doGet(urlOf(conn), conn.accessToken, timeoutMs);
+    let res = await this.send(urlOf(conn), conn.accessToken, method, body, timeoutMs);
     if (res.status === 401) {
       // Session expired — refresh the token once via the CLI and retry. Only
       // drop the cached session if it is still the one that got the 401; in a
@@ -140,7 +151,7 @@ export class SfRestService {
         this.connections.delete(username);
       }
       conn = await this.getEntry(username, timeoutMs).promise;
-      res = await this.doGet(urlOf(conn), conn.accessToken, timeoutMs);
+      res = await this.send(urlOf(conn), conn.accessToken, method, body, timeoutMs);
     }
     if (!res.ok) {
       let detail = '';
@@ -152,17 +163,21 @@ export class SfRestService {
     return res.text();
   }
 
-  private async doGet(url: string, token: string, timeoutMs?: number): Promise<RestResponse> {
+  private async send(url: string, token: string, method: string, body: unknown, timeoutMs?: number): Promise<RestResponse> {
     if (!this.fetchFn) {
       throw new SfCliError('No fetch implementation available for REST calls');
     }
     const controller = new AbortController();
     const effectiveTimeout = timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const timer = setTimeout(() => controller.abort(), effectiveTimeout);
+    const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+    const bodyStr = body !== undefined ? JSON.stringify(body) : undefined;
+    if (bodyStr !== undefined) headers['Content-Type'] = 'application/json';
     try {
       return await this.fetchFn(url, {
-        method: 'GET',
-        headers: { Authorization: `Bearer ${token}` },
+        method,
+        headers,
+        ...(bodyStr !== undefined ? { body: bodyStr } : {}),
         signal: controller.signal
       });
     } catch (err) {
@@ -174,5 +189,44 @@ export class SfRestService {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  // ─────────────────────────── Tooling helpers ───────────────────────────
+  // Small typed wrappers used by TraceFlag ensure (below). They reuse the same
+  // session cache + single-refresh-on-401 as the log fetch paths.
+
+  /** Run a Tooling SOQL query and return its records. */
+  async toolingQuery<T>(username: string, soql: string, timeoutMs?: number): Promise<T[]> {
+    const raw = await this.request(
+      username,
+      conn => `${conn.instanceUrl}/services/data/v${conn.apiVersion}/tooling/query?q=${encodeURIComponent(soql)}`,
+      { timeoutMs }
+    );
+    let parsed: { records?: T[] };
+    try {
+      parsed = JSON.parse(raw) as { records?: T[] };
+    } catch (err) {
+      throw new SfCliError('Failed to parse Tooling API query response', undefined, err);
+    }
+    return parsed.records ?? [];
+  }
+
+  /** Create a Tooling sObject; returns the new record id (Salesforce replies `{ id, success }`). */
+  async toolingCreate(username: string, sobject: string, fields: Record<string, unknown>, timeoutMs?: number): Promise<string> {
+    const raw = await this.request(
+      username,
+      conn => `${conn.instanceUrl}/services/data/v${conn.apiVersion}/tooling/sobjects/${sobject}`,
+      { method: 'POST', body: fields, timeoutMs }
+    );
+    let parsed: { id?: string; success?: boolean };
+    try {
+      parsed = JSON.parse(raw) as { id?: string; success?: boolean };
+    } catch (err) {
+      throw new SfCliError(`Failed to parse Tooling API create response for ${sobject}`, undefined, err);
+    }
+    if (!parsed.id) {
+      throw new SfCliError(`Tooling API create for ${sobject} returned no id`);
+    }
+    return parsed.id;
   }
 }

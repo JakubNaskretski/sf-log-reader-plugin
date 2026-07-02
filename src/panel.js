@@ -48,6 +48,8 @@
     activeUserId: saved.activeUserId ?? null,
     entries: saved.entries ?? [],
     stats: saved.stats ?? null,
+    truncated: saved.truncated ?? false,
+    total: saved.total ?? 0,
     filters: new Set(saved.filters ?? ['USER_DEBUG', 'SOQL', 'DML', 'EXCEPTION', 'CALLOUT']),
     search: saved.search ?? '',
     trail: [],
@@ -57,6 +59,21 @@
     renderLimit: RENDER_CHUNK
   };
 
+  // Persist the lightweight UI state only (no entries). Called on every keystroke
+  // and filter toggle — re-serializing a ≤20k-entry array on each of those was
+  // the per-keystroke cost the entries never change there. persistState() (below)
+  // writes the entries too, but only when they actually change (body load/select).
+  function persistUiState() {
+    const prev = vscode.getState() || {};
+    vscode.setState({
+      ...prev,
+      activeLogId: state.activeLogId,
+      activeUserId: state.activeUserId,
+      filters: Array.from(state.filters),
+      search: state.search
+    });
+  }
+
   function persistState() {
     vscode.setState({
       activeLogId: state.activeLogId,
@@ -65,6 +82,8 @@
       // restore (the 'logs' handler re-requests when entries are empty).
       entries: state.entries.length <= MAX_PERSIST_ENTRIES ? state.entries : [],
       stats: state.stats,
+      truncated: state.truncated,
+      total: state.total,
       filters: Array.from(state.filters),
       search: state.search
     });
@@ -79,7 +98,7 @@
       if (cb.checked) state.filters.add(cb.dataset.cat);
       else state.filters.delete(cb.dataset.cat);
       state.renderLimit = RENDER_CHUNK;
-      persistState();
+      persistUiState();
       renderEntries();
     });
   });
@@ -93,7 +112,7 @@
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => {
       state.renderLimit = RENDER_CHUNK;
-      persistState();
+      persistUiState();
       renderEntries();
     }, 150);
   });
@@ -242,6 +261,8 @@
         state.activeUserId = log.userId;
         state.entries = [];
         state.stats = null;
+        state.truncated = false;
+        state.total = 0;
         state.renderLimit = RENDER_CHUNK;
         persistState();
         if (state.external) {
@@ -452,6 +473,28 @@
       });
       detailBodyEl.appendChild(more);
     }
+    // The host caps how many parsed entries cross the bridge (HOST_ENTRY_CAP).
+    // When it did, tell the user and offer the full .log in an editor tab — the
+    // in-panel view can never show past the cap no matter how far they scroll.
+    if (state.truncated) {
+      const note = document.createElement('div');
+      note.className = 'empty';
+      const shownCount = state.entries.length;
+      const totalCount = state.total || shownCount;
+      note.textContent = `Showing the first ${shownCount.toLocaleString()} of ${totalCount.toLocaleString()} parsed entries. `;
+      if (!state.external && state.activeLogId) {
+        const link = document.createElement('button');
+        link.className = 'show-more';
+        link.textContent = 'Open the full log in an editor';
+        link.addEventListener('click', () => {
+          post({ type: 'openLogInEditor', logId: state.activeLogId, userId: state.activeUserId });
+        });
+        note.appendChild(link);
+      } else {
+        note.textContent += 'Open the source .log file for the full log.';
+      }
+      detailBodyEl.appendChild(note);
+    }
   }
 
   function renderTrail() {
@@ -561,6 +604,8 @@
         externalBanner.classList.remove('visible');
         state.entries = msg.entries || [];
         state.stats = msg.stats || null;
+        state.truncated = !!msg.truncated;
+        state.total = msg.total || state.entries.length;
         state.renderLimit = RENDER_CHUNK;
         persistState();
         renderDetailHeader(msg.stats, msg.logId, false);
@@ -611,6 +656,8 @@
           state.activeLogId = null;
           state.activeUserId = null;
           state.entries = msg.entries || [];
+          state.truncated = !!msg.truncated;
+          state.total = msg.total || state.entries.length;
           externalBanner.classList.add('visible');
           externalPathEl.textContent = msg.sourcePath;
           renderLogs();
@@ -619,6 +666,8 @@
         } else {
           state.external = null;
           state.entries = [];
+          state.truncated = false;
+          state.total = 0;
           externalBanner.classList.remove('visible');
           renderDetailHeader(null);
           renderEntries();

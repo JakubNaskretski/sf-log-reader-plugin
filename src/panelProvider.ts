@@ -13,6 +13,9 @@ import { generateNonce, getPanelHtml } from './panelHtml';
 import { parseLogs, summarize } from './logParser';
 import { generateSummary } from './summaryGenerator';
 import { SavedLogsService } from './savedLogs';
+import { capEntries } from './entryCap';
+import { TraceService } from './traceService';
+import { getSharedOrg, setSharedOrg } from './kit/orgs';
 
 type InboundMessage =
   | { type: 'ready' }
@@ -83,6 +86,7 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   private activeFetchOrg: string | null = null;
   /** Records of the running fetch whose bodies haven't finished (success or fail) yet. */
   private readonly remainingFetch = new Map<string, ApexLogRecord>();
+  private readonly traceService: TraceService;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -93,6 +97,7 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     private readonly output: vscode.OutputChannel
   ) {
     this.trail.onChange(() => this.postCommandTrail());
+    this.traceService = new TraceService(this.rest);
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -124,13 +129,18 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       matchOnDetail: true
     });
     if (picked) {
-      await this.orgStore.setOrg(picked.username);
+      await this.setActiveOrg(picked.username);
+      // Clear the previous org's user list — otherwise pickUser()/the dropdown
+      // would show/merge stale users from the org we just switched away from
+      // (mirrors the webview 'selectOrg' path).
+      this.users = [];
       this.postOrgs();
       await this.refreshStoredLogs();
     }
   }
 
   async pickUser(): Promise<void> {
+    await this.ensureOrgLoaded();
     const org = this.requireOrg();
     if (!org) return;
     if (this.users.length === 0) await this.loadUsers(org);
@@ -149,11 +159,51 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     await this.refreshStoredLogs();
   }
 
+  /**
+   * "Start capturing" — ensure a DEVELOPER_LOG TraceFlag exists for the current
+   * user so the org starts writing debug logs. Explicit user action (toolbar
+   * button / palette). Reports success/failure inline.
+   */
+  async startCapturing(): Promise<void> {
+    await this.ensureOrgLoaded();
+    const org = this.requireOrg();
+    if (!org) return;
+    if (!this.rest.available()) {
+      this.post({ type: 'status', text: 'Start capturing needs the REST path (global fetch) — unavailable on this VS Code build.', error: true });
+      return;
+    }
+    const timeoutMs = vscode.workspace.getConfiguration('sfLogReader').get<number>('commandTimeoutMs', 60_000);
+    this.postStatus('Enabling debug logging (setting a TraceFlag)…');
+    try {
+      const message = await this.traceService.ensureTraceFlag(org.username, org.username, timeoutMs);
+      this.postStatus(message);
+    } catch (err) {
+      this.reportCliError('start capturing', err);
+    }
+  }
+
+  /**
+   * Best-effort TraceFlag ensure sequenced at the start of a fetch (inside the
+   * lock region) so the logs we're about to list actually get written. Non-fatal
+   * and quiet: a failure must not block fetching already-existing logs, and we
+   * only ensure once REST is available (the ensure uses the REST session).
+   */
+  private async ensureTraceFlagQuietly(username: string, timeoutMs: number): Promise<void> {
+    if (!this.rest.available()) return;
+    try {
+      await this.traceService.ensureTraceFlag(username, username, timeoutMs);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[trace] could not ensure TraceFlag (non-fatal): ${message}`);
+    }
+  }
+
   async fetchLatest(): Promise<void> {
     if (this.fetchInFlight) {
       this.postStatus('A fetch is already running — new logs appear as they arrive.');
       return;
     }
+    await this.ensureOrgLoaded();
     const org = this.requireOrg();
     if (!org) return;
     const store = this.requireLogStore();
@@ -168,17 +218,29 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     this.fetchInFlight = true;
     this.post({ type: 'fetchState', running: true });
     try {
+      // Optionally ensure a TraceFlag first (inside the lock, before listing) so
+      // the org is actively writing logs. Off by default — creating a DebugLevel/
+      // TraceFlag mutates the org, so opt in via sfLogReader.autoTraceFlag; the
+      // explicit "Start capturing" button is the primary path. Non-fatal.
+      if (config.get<boolean>('autoTraceFlag', false)) {
+        await this.ensureTraceFlagQuietly(org.username, timeoutMs);
+      }
+      // Read the user filter up front so it can be applied server-side (WHERE
+      // LogUserId=…) — busy orgs otherwise return top-N org-wide logs that the
+      // client filter then drops to nothing. The client filter below stays as
+      // belt-and-suspenders (an unknown-shaped id, or a REST fallback to CLI,
+      // must never surface another user's logs).
+      const userId = this.orgStore.getUser(org.username);
       this.postStatus(`Listing latest ${limit} logs from ${orgAlias}…`);
       let records: ApexLogRecord[];
       try {
-        records = await this.listLogsFast(org.username, limit, timeoutMs);
+        records = await this.listLogsFast(org.username, limit, timeoutMs, userId);
         this.logsFromOrg = records;
       } catch (err) {
         this.reportCliError('list logs', err);
         return;
       }
 
-      const userId = this.orgStore.getUser(org.username);
       const filtered = userId ? records.filter(r => r.LogUserId === userId) : records;
       if (filtered.length === 0) {
         this.postStatus('No matching logs to fetch.');
@@ -274,17 +336,17 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
    * after the first fetch the token is cached, making this a single HTTP GET
    * instead of a ~1-3s CLI process — falling back to the CLI on any failure.
    */
-  private async listLogsFast(username: string, limit: number, timeoutMs: number): Promise<ApexLogRecord[]> {
+  private async listLogsFast(username: string, limit: number, timeoutMs: number, userId?: string): Promise<ApexLogRecord[]> {
     if (this.rest.available()) {
       this.rest.resetIfFailed(username);
       try {
-        return await this.rest.queryLogs(username, limit, timeoutMs);
+        return await this.rest.queryLogs(username, limit, timeoutMs, userId);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         this.output.appendLine(`[fetch] REST list failed, falling back to CLI: ${message}`);
       }
     }
-    return this.sf.listLogs(username, limit, timeoutMs);
+    return this.sf.listLogs(username, limit, timeoutMs, userId);
   }
 
   /** Download one log body — REST first (no process spawn), CLI as fallback. */
@@ -407,7 +469,7 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
         await this.refreshStoredLogs();
         return;
       case 'selectOrg':
-        await this.orgStore.setOrg(message.username);
+        await this.setActiveOrg(message.username);
         this.users = [];
         this.postOrgs();
         await this.refreshStoredLogs();
@@ -498,7 +560,13 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     const stats = summarize(entries);
     // The webview renders parsed entries only — the raw body stays out of the
     // message; serializing multi-MB strings across the bridge is pure overhead.
-    this.post({ type: 'logBody', logId, entries, stats });
+    // Cap the entries crossing postMessage: a 20 MB log parses to hundreds of
+    // thousands of entries, and posting the whole array on every row click is a
+    // huge structured clone the webview only ever renders `renderLimit` of at a
+    // time. Stats stay computed over the FULL log so the header counts are true;
+    // the user opens the .log file for the untruncated view.
+    const { entries: capped, truncated } = capEntries(entries);
+    this.post({ type: 'logBody', logId, userId, entries: capped, stats, total: entries.length, truncated });
   }
 
   async keepLog(logId: string, userId: string): Promise<void> {
@@ -610,7 +678,11 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   }
 
   private savedLogsFolderSetting(): string {
-    return vscode.workspace.getConfiguration('sfLogReader').get<string>('savedLogsFolder', 'saved-logs');
+    // Default matches the manifest (empty string) — SavedLogsService maps '' to
+    // ~/sf-saved-logs. The old 'saved-logs' code fallback diverged from the
+    // manifest default and would have resolved to a workspace-relative folder if
+    // the setting were ever read before the manifest default applied.
+    return vscode.workspace.getConfiguration('sfLogReader').get<string>('savedLogsFolder', '');
   }
 
   private displayPath(absolute: string): string {
@@ -642,13 +714,18 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       this.externalLog = { sourcePath: target.fsPath, body };
       const entries = parseLogs(body);
       const stats = summarize(entries);
+      // Same host-side cap as the stored-log path — a large external .log must
+      // not push its full parsed array across the bridge.
+      const { entries: capped, truncated } = capEntries(entries);
       this.post({
         type: 'externalLog',
         loaded: true,
         name: path.basename(target.fsPath),
         sourcePath: target.fsPath,
-        entries,
-        stats
+        entries: capped,
+        stats,
+        total: entries.length,
+        truncated
       });
       this.postStatus(`Viewing ${vscode.workspace.asRelativePath(target.fsPath)} (${entries.length} entries)`);
     } catch (err) {
@@ -744,12 +821,17 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     try {
       const timeoutMs = vscode.workspace.getConfiguration('sfLogReader').get<number>('commandTimeoutMs', 60_000);
       this.orgs = await this.sf.listOrgs(timeoutMs);
-      const current = this.orgStore.getOrg();
+      // Consider the shared cross-plugin setting, not just the private store, so
+      // an org chosen in a sibling plugin survives the auto-select below. Adopt
+      // it into the private store when present so postOrgs/getUser key on it.
+      const current = this.effectiveOrgUsername();
       if (current && !this.orgs.some(o => o.username === current)) {
-        await this.orgStore.setOrg(undefined);
+        await this.setActiveOrg(undefined);
+      } else if (current && this.orgStore.getOrg() !== current) {
+        await this.orgStore.setOrg(current);
       } else if (!current) {
         const defaultOrg = this.orgs.find(o => o.isDefaultUsername) ?? this.orgs[0];
-        if (defaultOrg) await this.orgStore.setOrg(defaultOrg.username);
+        if (defaultOrg) await this.setActiveOrg(defaultOrg.username);
       }
       this.postOrgs();
       if (notifyOnEmpty && this.orgs.length === 0) {
@@ -853,8 +935,59 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /**
+   * Resolve the effective target-org username: the private store first, then the
+   * shared cross-plugin setting (`skrety.salesforce.targetOrg`) as a fallback so
+   * an org selected in a sibling family plugin is honored here too.
+   */
+  private effectiveOrgUsername(): string | undefined {
+    return this.orgStore.getOrg() ?? getSharedOrg();
+  }
+
+  /**
+   * Persist a user-chosen target org to BOTH the private store and the shared
+   * cross-plugin setting (`skrety.salesforce.targetOrg`) so a switch here also
+   * moves sibling family plugins. The shared-org config watcher
+   * in extension.ts no-ops when the value is unchanged, so this doesn't loop.
+   */
+  private async setActiveOrg(username: string | undefined): Promise<void> {
+    await this.orgStore.setOrg(username);
+    await setSharedOrg(username);
+  }
+
+  /**
+   * React to a shared-org change made by a sibling plugin (or the user editing
+   * the setting): adopt it into the private store and refresh, but only when it
+   * actually differs from what we already have (avoids a redundant reload when
+   * we were the writer).
+   */
+  async onSharedOrgChanged(username: string | undefined): Promise<void> {
+    if (username === this.orgStore.getOrg()) return;
+    await this.orgStore.setOrg(username);
+    this.users = [];
+    if (this.orgs.length === 0 && username) await this.loadOrgs();
+    this.postOrgs();
+    await this.refreshStoredLogs();
+  }
+
+  /**
+   * Ensure the org list is loaded and a target org is resolved before a palette
+   * command that would otherwise fail cold (the panel — and its 'ready' load —
+   * may never have opened). Seeds the store from the shared setting when needed.
+   * Handles the palette-before-panel case.
+   */
+  private async ensureOrgLoaded(): Promise<void> {
+    // Adopt a shared-setting org into the private store so requireOrg's in-memory
+    // lookup (and getUser keying) resolve it consistently.
+    if (!this.orgStore.getOrg()) {
+      const shared = getSharedOrg();
+      if (shared) await this.orgStore.setOrg(shared);
+    }
+    if (this.orgs.length === 0) await this.loadOrgs();
+  }
+
   private requireOrg(prompt = true): OrgInfo | undefined {
-    const username = this.orgStore.getOrg();
+    const username = this.effectiveOrgUsername();
     const org = username ? this.orgs.find(o => o.username === username) : undefined;
     if (!org && prompt) {
       vscode.window.showWarningMessage('Select a Salesforce org first.');

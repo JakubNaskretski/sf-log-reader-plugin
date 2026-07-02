@@ -58,6 +58,11 @@
         "icon": "$(cloud-download)"
       },
       {
+        "command": "sfLogReader.startCapturing",
+        "title": "SF Log Reader: Start Capturing (Set Debug TraceFlag)",
+        "icon": "$(record)"
+      },
+      {
         "command": "sfLogReader.selectOrg",
         "title": "SF Log Reader: Select Org"
       },
@@ -89,14 +94,19 @@
     "menus": {
       "view/title": [
         {
-          "command": "sfLogReader.fetchLatest",
+          "command": "sfLogReader.startCapturing",
           "when": "view == sfLogReader.panelView",
           "group": "navigation@1"
         },
         {
-          "command": "sfLogReader.refresh",
+          "command": "sfLogReader.fetchLatest",
           "when": "view == sfLogReader.panelView",
           "group": "navigation@2"
+        },
+        {
+          "command": "sfLogReader.refresh",
+          "when": "view == sfLogReader.panelView",
+          "group": "navigation@3"
         },
         {
           "command": "sfLogReader.selectOrg",
@@ -136,6 +146,11 @@
           "minimum": 1,
           "maximum": 10,
           "description": "How many log-body downloads to run in parallel. Higher = faster but more pressure on the org's API limits."
+        },
+        "sfLogReader.autoTraceFlag": {
+          "type": "boolean",
+          "default": false,
+          "description": "Before each fetch, automatically ensure a DEVELOPER_LOG TraceFlag is active for the current user so the org keeps writing debug logs. This creates a DebugLevel and TraceFlag on the org. Off by default — use the 'Start Capturing' toolbar button for a one-off instead."
         },
         "sfLogReader.mermaidMaxEdges": {
           "type": "number",

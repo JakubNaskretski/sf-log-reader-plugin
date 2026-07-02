@@ -4,6 +4,7 @@ import { SfCliService, normalizeApiVersion } from './sfCliService';
 import { SfRestService } from './restClient';
 import { OrgStore } from './orgStore';
 import { LogReaderPanelProvider, migrateLegacyStorage } from './panelProvider';
+import { migrateToSharedOrg, onSharedOrgChange } from './kit/orgs';
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel('SF Log Reader');
@@ -23,11 +24,27 @@ export function activate(context: vscode.ExtensionContext): void {
     output.appendLine(`Legacy storage migration failed: ${(err as Error).message}`);
   });
 
+  // One-time seed of the shared cross-plugin org setting from this plugin's
+  // private key (no-ops once the shared setting is populated). Adopt the
+  // resolved value into the private store so both stay in sync. The setting
+  // SCHEMA is contributed by sf-org-deploy-helper only — we read/write it
+  // undeclared.
+  migrateToSharedOrg(orgStore.getOrg())
+    .then(effective => { if (effective && effective !== orgStore.getOrg()) return orgStore.setOrg(effective); })
+    .catch(err => output.appendLine(`Shared-org seed failed: ${(err as Error).message}`));
+
   context.subscriptions.push(
     output,
+    // React to org changes made by a sibling family plugin via the shared setting.
+    onSharedOrgChange(username => {
+      provider.onSharedOrgChanged(username).catch(err =>
+        output.appendLine(`Shared-org change handling failed: ${(err as Error).message}`)
+      );
+    }),
     vscode.window.registerWebviewViewProvider(LogReaderPanelProvider.viewType, provider),
     vscode.commands.registerCommand('sfLogReader.refresh', () => provider.refreshStoredLogs()),
     vscode.commands.registerCommand('sfLogReader.fetchLatest', () => provider.fetchLatest()),
+    vscode.commands.registerCommand('sfLogReader.startCapturing', () => provider.startCapturing()),
     vscode.commands.registerCommand('sfLogReader.selectOrg', () => provider.pickOrg()),
     vscode.commands.registerCommand('sfLogReader.selectUser', () => provider.pickUser()),
     vscode.commands.registerCommand('sfLogReader.openLogFolder', () => provider.openLogFolder()),
