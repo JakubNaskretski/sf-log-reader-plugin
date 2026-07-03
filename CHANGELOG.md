@@ -3,6 +3,25 @@
 All notable changes to the SF Log Reader extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.7.0
+
+- **Timeline flame chart.** A new Timeline tab in the log detail pane draws the
+  transaction as a flame chart — code units, methods, SOQL, DML, and callouts as
+  nested time bars. Ctrl+wheel (or pinch) zooms around the cursor, drag pans,
+  hovering shows durations and details, and clicking a bar jumps to that line in
+  the log view. Logs cut off by the 20 MB cap render with their open frames
+  marked as truncated.
+- **Analysis tab.** Governor-limit usage bars (with warning colors as you
+  approach a limit), observed SOQL/DML/callout counts, per-query timings with
+  row counts, a DML breakdown, hottest methods, and per-class/trigger
+  attribution — all computed from the log without leaving the panel.
+- **Profiling capture preset.** Start Capturing now offers "Standard" or
+  "Profiling (FINEST)". The profiling preset records method-level detail so the
+  Timeline can show method bars — note logs get much larger. Method detail only
+  appears for class/trigger code; anonymous Apex never emits it.
+- The markdown summary and the new tabs now share one analysis engine, so their
+  numbers always agree.
+
 ## 0.6.0
 
 - **Start Capturing.** A toolbar button ensures a debug TraceFlag for the
