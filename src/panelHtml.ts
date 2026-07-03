@@ -230,6 +230,33 @@ export function getPanelHtml(webview: vscode.Webview, extensionUri: vscode.Uri, 
       font-size: 11px;
       cursor: pointer;
     }
+    .detail-tabs {
+      display: flex;
+      gap: 2px;
+      padding: 4px 8px 0;
+      border-bottom: 1px solid var(--vscode-panel-border);
+      flex-shrink: 0;
+      background: var(--vscode-panel-background);
+    }
+    .detail-tabs button {
+      background: transparent;
+      color: var(--vscode-descriptionForeground);
+      border: 1px solid transparent;
+      border-bottom: none;
+      padding: 4px 12px;
+      font-size: 11px;
+      cursor: pointer;
+      border-radius: 3px 3px 0 0;
+    }
+    .detail-tabs button:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
+    .detail-tabs button.active {
+      color: var(--vscode-foreground);
+      background: var(--vscode-editor-background);
+      border-color: var(--vscode-panel-border);
+      font-weight: 600;
+    }
+    .tab-pane { display: none; flex-direction: column; min-height: 0; flex: 1 1 auto; overflow: hidden; }
+    .tab-pane.active { display: flex; }
     .detail-header .stats { display: flex; gap: 8px; flex-wrap: wrap; }
     .detail-header .stat { white-space: nowrap; }
     .detail-header .stat strong { color: var(--vscode-foreground); }
@@ -274,6 +301,10 @@ export function getPanelHtml(webview: vscode.Webview, extensionUri: vscode.Uri, 
       padding-left: 16px;
     }
     .log-entry.search-hit { background: var(--vscode-editor-findMatchHighlightBackground, rgba(255,200,0,0.15)); }
+    .log-entry.entry-flash {
+      background: var(--vscode-editor-selectionHighlightBackground, rgba(55,148,255,0.25));
+      transition: background 0.4s ease-out;
+    }
     .cat-USER_DEBUG .type { color: var(--vscode-debugConsole-infoForeground, #3794ff); }
     .cat-SOQL .type { color: var(--vscode-editorWarning-foreground, #d29922); }
     .cat-DML .type { color: var(--vscode-charts-purple, #9d4edd); }
@@ -283,6 +314,153 @@ export function getPanelHtml(webview: vscode.Webview, extensionUri: vscode.Uri, 
     .cat-METHOD .type { color: var(--vscode-descriptionForeground); }
     .cat-LIMITS .type { color: var(--vscode-charts-orange, #d29922); }
     .cat-SYSTEM .type { color: var(--vscode-descriptionForeground, #8b8b8b); }
+    .analysis-body {
+      flex: 1;
+      overflow: auto;
+      font-size: 12px;
+      padding: 8px 10px;
+    }
+    .analysis-body .empty {
+      padding: 12px;
+      opacity: 0.6;
+      font-style: italic;
+    }
+    .analysis-header-line {
+      font-size: 12px;
+      margin-bottom: 10px;
+      color: var(--vscode-foreground);
+    }
+    .analysis-section {
+      margin-bottom: 16px;
+    }
+    .analysis-section h3 {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--vscode-descriptionForeground);
+      margin: 0 0 6px;
+      font-weight: 600;
+    }
+    .analysis-section .section-empty {
+      opacity: 0.6;
+      font-style: italic;
+      font-size: 11px;
+    }
+    .analysis-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11px;
+    }
+    .analysis-table th, .analysis-table td {
+      text-align: left;
+      padding: 3px 8px 3px 0;
+      border-bottom: 1px solid var(--vscode-panel-border);
+      vertical-align: top;
+    }
+    .analysis-table th {
+      color: var(--vscode-descriptionForeground);
+      font-weight: 600;
+    }
+    .analysis-table.two-col { max-width: 420px; }
+    .limit-row {
+      display: grid;
+      grid-template-columns: 160px 90px 1fr;
+      gap: 8px;
+      align-items: center;
+      padding: 3px 0;
+      font-size: 11px;
+    }
+    .limit-row .limit-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .limit-row .limit-used { color: var(--vscode-descriptionForeground); white-space: nowrap; }
+    .limit-bar-track {
+      background: var(--vscode-input-background, rgba(128,128,128,0.2));
+      border: 1px solid var(--vscode-panel-border);
+      height: 8px;
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .limit-bar-fill {
+      height: 100%;
+      background: var(--vscode-charts-green, #2ea043);
+    }
+    .limit-bar-fill.warn { background: var(--vscode-charts-orange, var(--vscode-editorWarning-foreground, #d29922)); }
+    .limit-bar-fill.error { background: var(--vscode-testing-iconFailed, #f85149); }
+    .limit-exception-row {
+      padding: 4px 6px;
+      margin-bottom: 4px;
+      border-left: 3px solid var(--vscode-testing-iconFailed, #f85149);
+      background: var(--vscode-inputValidation-errorBackground, rgba(248,81,73,0.1));
+      font-size: 11px;
+    }
+    .limit-exception-row .exc-message { color: var(--vscode-foreground); }
+    .limit-exception-row .exc-meta { color: var(--vscode-descriptionForeground); font-size: 10px; margin-top: 2px; }
+    .timeline-header {
+      padding: 6px 8px;
+      font-size: 11px;
+      background: var(--vscode-panel-background);
+      border-bottom: 1px solid var(--vscode-panel-border);
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+      flex-shrink: 0;
+    }
+    .timeline-header .empty { opacity: 0.6; font-style: italic; }
+    .timeline-header .tl-stat strong { color: var(--vscode-foreground); }
+    .timeline-header .tl-warn { color: var(--vscode-testing-iconFailed, #f85149); }
+    .timeline-header .tl-hint { color: var(--vscode-descriptionForeground); font-style: italic; }
+    .timeline-header button {
+      margin-left: auto;
+      background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
+      color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground));
+      border: 1px solid var(--vscode-button-border, transparent);
+      padding: 2px 8px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .timeline-body {
+      flex: 1;
+      overflow: hidden;
+      position: relative;
+    }
+    .timeline-body .empty {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      padding: 12px;
+      opacity: 0.6;
+      font-style: italic;
+    }
+    #timeline-canvas {
+      display: block;
+      width: 100%;
+      max-width: 100%;
+      cursor: default;
+    }
+    #timeline-canvas.dragging { cursor: grabbing; }
+    #timeline-tooltip {
+      position: absolute;
+      display: none;
+      pointer-events: none;
+      background: var(--vscode-editorHoverWidget-background, var(--vscode-panel-background));
+      color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground));
+      border: 1px solid var(--vscode-editorHoverWidget-border, var(--vscode-panel-border));
+      font-size: 11px;
+      padding: 4px 6px;
+      max-width: 360px;
+      z-index: 10;
+    }
+    #timeline-tooltip .label { font-weight: 600; word-break: break-word; }
+    #timeline-tooltip .meta { color: var(--vscode-descriptionForeground); font-size: 10px; margin-top: 2px; }
+    #timeline-tooltip .detail {
+      margin-top: 4px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 10px;
+      opacity: 0.85;
+    }
     .trail {
       flex-shrink: 0;
       border-top: 1px solid var(--vscode-panel-border);
@@ -381,11 +559,32 @@ export function getPanelHtml(webview: vscode.Webview, extensionUri: vscode.Uri, 
         <button id="external-summary" title="Generate a .summary.md next to the source file">Summary</button>
         <button id="external-close" title="Close external view">&times;</button>
       </div>
-      <div class="detail-header" id="detail-header">
-        <span class="empty">No log selected.</span>
+      <div class="detail-tabs" id="detail-tabs">
+        <button class="tab-btn active" data-tab="log-tab">Log</button>
+        <button class="tab-btn" data-tab="analysis-tab">Analysis</button>
+        <button class="tab-btn" data-tab="timeline-tab">Timeline</button>
       </div>
-      <div class="detail-body" id="detail-body">
-        <div class="empty">Pick a log on the left.</div>
+      <div class="tab-pane active" id="log-tab">
+        <div class="detail-header" id="detail-header">
+          <span class="empty">No log selected.</span>
+        </div>
+        <div class="detail-body" id="detail-body">
+          <div class="empty">Pick a log on the left.</div>
+        </div>
+      </div>
+      <div class="tab-pane" id="analysis-tab">
+        <div class="analysis-body" id="analysis-body">
+          <div class="empty">No log selected.</div>
+        </div>
+      </div>
+      <div class="tab-pane" id="timeline-tab">
+        <div class="timeline-header" id="timeline-header">
+          <span class="empty">No log selected.</span>
+        </div>
+        <div class="timeline-body" id="timeline-body">
+          <canvas id="timeline-canvas"></canvas>
+          <div id="timeline-tooltip"></div>
+        </div>
       </div>
     </div>
   </div>

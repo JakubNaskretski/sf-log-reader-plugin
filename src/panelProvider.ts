@@ -16,6 +16,8 @@ import { SavedLogsService } from './savedLogs';
 import { capEntries } from './entryCap';
 import { TraceService } from './traceService';
 import { getSharedOrg, setSharedOrg } from './kit/orgs';
+import { buildAnalysis } from './analysisModel';
+import { buildCallTree } from './callTree';
 
 type InboundMessage =
   | { type: 'ready' }
@@ -37,7 +39,9 @@ type InboundMessage =
   | { type: 'generateExternalSummary' }
   | { type: 'deleteAllLogs' }
   | { type: 'clearCommandTrail' }
-  | { type: 'openLogFolder' };
+  | { type: 'openLogFolder' }
+  | { type: 'requestAnalysis'; logId: string; userId?: string; external?: boolean }
+  | { type: 'requestTimeline'; logId: string; userId?: string; external?: boolean };
 
 interface OrgViewModel {
   username: string;
@@ -173,9 +177,9 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       return;
     }
     const timeoutMs = vscode.workspace.getConfiguration('sfLogReader').get<number>('commandTimeoutMs', 60_000);
-    this.postStatus('Enabling debug logging (setting a TraceFlag)…');
     try {
-      const message = await this.traceService.ensureTraceFlag(org.username, org.username, timeoutMs);
+      const message = await this.traceService.pickPresetAndEnsure(org.username, org.username, timeoutMs);
+      if (message === undefined) return; // picker cancelled
       this.postStatus(message);
     } catch (err) {
       this.reportCliError('start capturing', err);
@@ -537,6 +541,62 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       case 'openLogFolder':
         await this.openLogFolder();
         return;
+      case 'requestAnalysis':
+        await this.sendAnalysis(message.logId, message.userId, message.external);
+        return;
+      case 'requestTimeline':
+        await this.sendTimeline(message.logId, message.userId, message.external);
+        return;
+    }
+  }
+
+  private async sendTimeline(logId: string, userId: string | undefined, external: boolean | undefined): Promise<void> {
+    try {
+      const body = await this.loadBodyFor(logId, userId, external);
+      if (body === undefined) {
+        this.post({ type: 'timelineError', logId, message: 'Log body not available locally.' });
+        return;
+      }
+      const { spans, totalNanos, spanCapHit } = buildCallTree(parseLogs(body));
+      this.post({ type: 'timelineData', logId, spans, totalNanos, spanCapHit });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[timeline] ${message}`);
+      this.post({ type: 'timelineError', logId, message });
+    }
+  }
+
+  /**
+   * Resolve a log body for the per-tab data requests (analysis / timeline):
+   * external logs are keyed by source path (sent back as logId, mirroring
+   * openExternalLog); stored logs are read by (orgAlias, userId, logId).
+   */
+  private async loadBodyFor(logId: string, userId: string | undefined, external: boolean | undefined): Promise<string | undefined> {
+    if (external) {
+      if (this.externalLog && this.externalLog.sourcePath === logId) return this.externalLog.body;
+      return undefined;
+    }
+    const org = this.requireOrg(false);
+    const store = this.getLogStore();
+    if (org && store && userId) {
+      return store.readBody(org.alias ?? org.username, userId, logId);
+    }
+    return undefined;
+  }
+
+  private async sendAnalysis(logId: string, userId: string | undefined, external: boolean | undefined): Promise<void> {
+    try {
+      const body = await this.loadBodyFor(logId, userId, external);
+      if (body === undefined) {
+        this.post({ type: 'analysisError', logId, message: 'Log body not available locally.' });
+        return;
+      }
+      const payload = buildAnalysis(body);
+      this.post({ type: 'analysisData', logId, payload });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[analysis] ${message}`);
+      this.post({ type: 'analysisError', logId, message });
     }
   }
 
