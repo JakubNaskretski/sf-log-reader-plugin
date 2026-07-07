@@ -42,21 +42,35 @@ export function activate(context: vscode.ExtensionContext): void {
       );
     }),
     vscode.window.registerWebviewViewProvider(LogReaderPanelProvider.viewType, provider),
-    vscode.commands.registerCommand('sfLogReader.refresh', () => provider.refreshStoredLogs()),
-    vscode.commands.registerCommand('sfLogReader.fetchLatest', () => provider.fetchLatest()),
-    vscode.commands.registerCommand('sfLogReader.startCapturing', () => provider.startCapturing()),
-    vscode.commands.registerCommand('sfLogReader.selectOrg', () => provider.pickOrg()),
-    vscode.commands.registerCommand('sfLogReader.selectUser', () => provider.pickUser()),
-    vscode.commands.registerCommand('sfLogReader.openLogFolder', () => provider.openLogFolder()),
-    vscode.commands.registerCommand('sfLogReader.clearLocalLogs', () => provider.clearLocalLogs()),
-    vscode.commands.registerCommand('sfLogReader.generateSummary', async () => {
+    registerSafe('sfLogReader.refresh', () => provider.refreshStoredLogs()),
+    registerSafe('sfLogReader.fetchLatest', () => provider.fetchLatest()),
+    registerSafe('sfLogReader.startCapturing', () => provider.startCapturing()),
+    registerSafe('sfLogReader.selectOrg', () => provider.pickOrg()),
+    registerSafe('sfLogReader.selectUser', () => provider.pickUser()),
+    registerSafe('sfLogReader.openLogFolder', () => provider.openLogFolder()),
+    registerSafe('sfLogReader.clearLocalLogs', () => provider.clearLocalLogs()),
+    registerSafe('sfLogReader.generateSummary', async () => {
       const logId = await vscode.window.showInputBox({ prompt: 'ApexLog Id (07L…) to summarize' });
       const userId = await vscode.window.showInputBox({ prompt: 'LogUserId (005…) that owns the log' });
       if (logId && userId) await provider.generateSummaryFor(logId, userId);
     }),
-    vscode.commands.registerCommand('sfLogReader.openLogFile', (uri?: vscode.Uri) => provider.openExternalLog(uri)),
-    vscode.commands.registerCommand('sfLogReader.openSavedLogsFolder', () => provider.openSavedLogsFolder())
+    registerSafe('sfLogReader.openLogFile', (uri?: vscode.Uri) => provider.openExternalLog(uri)),
+    registerSafe('sfLogReader.openSavedLogsFolder', () => provider.openSavedLogsFolder())
   );
+
+  // A rejected command handler (e.g. the org pick failing to save the shared
+  // setting) is otherwise an unhandled rejection the user never sees.
+  function registerSafe(id: string, fn: (...args: [vscode.Uri?]) => Promise<unknown> | void): vscode.Disposable {
+    return vscode.commands.registerCommand(id, (...args: [vscode.Uri?]) => {
+      void Promise.resolve(fn(...args)).catch(err => {
+        const msg = err instanceof Error ? err.message : String(err);
+        output.appendLine(`[${id}] ${msg}`);
+        void vscode.window.showErrorMessage(`SF Log Reader: ${msg}`, 'Show Output').then(choice => {
+          if (choice === 'Show Output') output.show(true);
+        });
+      });
+    });
+  }
 }
 
 export function deactivate(): void {
