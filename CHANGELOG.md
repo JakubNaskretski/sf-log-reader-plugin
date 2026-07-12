@@ -3,6 +3,13 @@
 All notable changes to the SF Log Reader extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.7.2
+
+- Fixed: **Duplicate lookups collapsed.** Opening the panel while picking an org — or
+  switching the shared org from another Skrety plugin — could spawn several identical
+  `sf` list processes at once. Org and user lookups now share one in-flight call, so a
+  burst of triggers costs a single process.
+
 ## 0.7.1
 
 - Fixed: **No more silent failures.** A panel click or a command (org/user pick, refresh,

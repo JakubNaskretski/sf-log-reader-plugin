@@ -887,7 +887,24 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async loadOrgs(notifyOnEmpty = false): Promise<void> {
+  /** Shared in-flight org load — webview `ready`, the org picker, the shared-org
+   *  config watcher and the fetch/capture commands can all request one at the
+   *  same moment; share a single `sf org list` instead of one spawn per caller. */
+  private loadOrgsInflight?: Promise<void>;
+
+  private loadOrgs(notifyOnEmpty = false): Promise<void> {
+    const inflight = this.loadOrgsInflight;
+    if (inflight) {
+      // Joining a silent load must not swallow an explicit refresh's warning.
+      if (!notifyOnEmpty) return inflight;
+      return inflight.then(() => {
+        if (this.orgs.length === 0) vscode.window.showWarningMessage('No authenticated Salesforce orgs found.');
+      });
+    }
+    return this.loadOrgsInflight = this.doLoadOrgs(notifyOnEmpty).finally(() => { this.loadOrgsInflight = undefined; });
+  }
+
+  private async doLoadOrgs(notifyOnEmpty: boolean): Promise<void> {
     try {
       const timeoutMs = vscode.workspace.getConfiguration('sfLogReader').get<number>('commandTimeoutMs', 60_000);
       this.orgs = await this.sf.listOrgs(timeoutMs);
@@ -912,7 +929,21 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async loadUsers(org: OrgInfo): Promise<void> {
+  /** Same single-flight idea, keyed by org — the user picker and the refresh
+   *  message both load users for the CURRENT org; a request for a different org
+   *  (org just switched) must not join the stale load, so it runs fresh. */
+  private loadUsersInflight?: { org: string; promise: Promise<void> };
+
+  private loadUsers(org: OrgInfo): Promise<void> {
+    if (this.loadUsersInflight?.org === org.username) return this.loadUsersInflight.promise;
+    const promise = this.doLoadUsers(org).finally(() => {
+      if (this.loadUsersInflight?.promise === promise) this.loadUsersInflight = undefined;
+    });
+    this.loadUsersInflight = { org: org.username, promise };
+    return promise;
+  }
+
+  private async doLoadUsers(org: OrgInfo): Promise<void> {
     try {
       const timeoutMs = vscode.workspace.getConfiguration('sfLogReader').get<number>('commandTimeoutMs', 60_000);
       this.users = await this.sf.listActiveUsers(org.username, timeoutMs);
