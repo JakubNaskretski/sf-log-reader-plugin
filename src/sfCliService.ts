@@ -75,6 +75,10 @@ export class SfCliService {
   }
 
   async listOrgs(timeoutMs?: number): Promise<OrgInfo[]> {
+    // --skip-connection-status: don't probe every org's auth over the network.
+    // That probe is the slow part of `sf org list` (seconds per org), and an org
+    // that fails it can drop out of the result — which used to wipe the saved
+    // selection. We never read connectedStatus, so skipping it is pure win.
     const result = await this.runJson<{
       result: {
         nonScratchOrgs?: OrgInfo[];
@@ -82,7 +86,7 @@ export class SfCliService {
         sandboxes?: OrgInfo[];
         other?: OrgInfo[];
       };
-    }>(['org', 'list', '--json'], { timeoutMs, note: 'list orgs' });
+    }>(['org', 'list', '--skip-connection-status', '--json'], { timeoutMs, note: 'list orgs' });
 
     const buckets = result.result ?? {};
     const all = [

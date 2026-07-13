@@ -3,6 +3,18 @@
 All notable changes to the SF Log Reader extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.7.3
+
+- Fixed: **One flaky org listing can't deselect your org anymore.** The org list now skips
+  the per-org connection probe, and the selection shared across the Skrety Salesforce
+  plugins is only cleared when a successful, non-empty listing genuinely doesn't contain
+  it. On startup, a remembered org is validated before being re-published to the other
+  plugins, so a long-gone org can't be resurrected.
+- Fixed: **Org switches made in sibling plugins fully refresh the panel.** The user filter
+  and log list follow the new org instead of keeping the previous org's entries, a user
+  list still loading for the old org is discarded, and fetch results now name the org they
+  came from.
+
 ## 0.7.2
 
 - Fixed: **Duplicate lookups collapsed.** Opening the panel while picking an org — or

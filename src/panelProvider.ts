@@ -81,7 +81,6 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private orgs: OrgInfo[] = [];
   private users: UserRecord[] = [];
-  private logsFromOrg: ApexLogRecord[] = [];
   private externalLog: { sourcePath: string; body: string } | null = null;
   private readonly savedLogs = new SavedLogsService();
   private fetchInFlight = false;
@@ -249,7 +248,6 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       let records: ApexLogRecord[];
       try {
         records = await this.listLogsFast(org.username, limit, timeoutMs, userId);
-        this.logsFromOrg = records;
       } catch (err) {
         this.reportCliError('list logs', err);
         return;
@@ -331,7 +329,7 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
           note: `download ${total} log bodies (${viaRest} via REST, ${total - viaRest} via CLI)`
         });
       }
-      this.postStatus(`Fetched ${saved} new · ${cached} already stored · ${failures.length} error${failures.length === 1 ? '' : 's'}`);
+      this.postStatus(`Fetched from ${orgAlias}: ${saved} new · ${cached} already stored · ${failures.length} error${failures.length === 1 ? '' : 's'}`);
       await this.refreshStoredLogs();
     } finally {
       this.fetchInFlight = false;
@@ -912,7 +910,13 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       // an org chosen in a sibling plugin survives the auto-select below. Adopt
       // it into the private store when present so postOrgs/getUser key on it.
       const current = this.effectiveOrgUsername();
-      if (current && !this.orgs.some(o => o.username === current)) {
+      // Clear the shared selection ONLY on a genuinely non-empty listing that
+      // omits the current org (a real "org gone"). A failed `sf org list` throws
+      // (caught below, this.orgs untouched, so the clear is unreachable), and an
+      // empty listing is treated as a transient blip — never a wipe. Clearing the
+      // shared setting off one flaky/empty result would yank the org out from
+      // under every sibling family plugin.
+      if (this.orgs.length > 0 && current && !this.orgs.some(o => o.username === current)) {
         await this.setActiveOrg(undefined);
       } else if (current && this.orgStore.getOrg() !== current) {
         await this.orgStore.setOrg(current);
@@ -946,7 +950,12 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   private async doLoadUsers(org: OrgInfo): Promise<void> {
     try {
       const timeoutMs = vscode.workspace.getConfiguration('sfLogReader').get<number>('commandTimeoutMs', 60_000);
-      this.users = await this.sf.listActiveUsers(org.username, timeoutMs);
+      const users = await this.sf.listActiveUsers(org.username, timeoutMs);
+      // Landing guard: the org may have switched while this list was in flight.
+      // Without it, org-A's users would overwrite this.users and post under org-B
+      // (the in-flight dedupe keys by org, but a switch-away still lands here).
+      if (this.orgStore.getOrg() !== org.username) return;
+      this.users = users;
       this.postUsers();
     } catch (err) {
       this.reportCliError('list users', err);
@@ -1065,9 +1074,25 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   async onSharedOrgChanged(username: string | undefined): Promise<void> {
     if (username === this.orgStore.getOrg()) return;
     await this.orgStore.setOrg(username);
+    // Drop the previous org's users from memory; the posts below replace them in
+    // the webview too (clearing this.users alone leaves org-A's names rendered in
+    // the filter until the next postUsers).
     this.users = [];
-    if (this.orgs.length === 0 && username) await this.loadOrgs();
+    // An external switch can name an org authenticated since our last
+    // `sf org list`, so it may be absent from the cached list. Reload then —
+    // otherwise the dropdown has no option to select it and requireOrg() fails
+    // the fetch commands with "Select a Salesforce org first". (The old check
+    // only reloaded when the whole list was empty.)
+    const needReload = username ? !this.orgs.some(o => o.username === username) : false;
+    if (needReload) await this.loadOrgs();
     this.postOrgs();
+    // Refresh the user filter for the new org — load its users, or post an empty
+    // list when no org resolves — so nothing from the previous org lingers. Runs
+    // before refreshStoredLogs so its postUsers(metas) lands last with this.users
+    // populated (org users ∪ log-derived users).
+    const org = this.requireOrg(false);
+    if (org) await this.loadUsers(org);
+    else this.postUsers();
     await this.refreshStoredLogs();
   }
 
