@@ -1,6 +1,6 @@
-import { spawn } from 'child_process';
+import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 import { CommandTrail } from './commandTrail';
-import { resolveSfCommand } from './kit/sfCli';
+import { planSpawn, resolveSfCommand } from './kit/sfCli';
 
 export interface OrgInfo {
   username: string;
@@ -210,12 +210,27 @@ export class SfCliService {
       let notFound = false;
 
       // Resolve the sf launcher once (kit shim-resolution): on Windows the real
-      // launcher is `sf.cmd`/`sf.ps1`, which Node refuses to spawn as the bare
-      // name (EINVAL since the CVE-2024-27980 hardening). We spawn the resolved
-      // absolute path with shell:false — no shell, so args pass through as an
-      // argv array verbatim with NO cmd.exe quoting needed (retiring the old
-      // shell:true + quoteForCmd path and its `%`-expansion gap).
-      const child = spawn(this.sfCommand(), args, { shell: false });
+      // launcher is `sf.cmd`/`sf.ps1`. A resolved `.cmd`/`.bat` path still can't
+      // be spawned with shell:false on Node >=20.12 (EINVAL, CVE-2024-27980
+      // hardening) — planSpawn bypasses it to `node .../bin/run.js` when the npm
+      // layout exists, else frames it through `cmd.exe /d /s /c` with strict arg
+      // validation. Anything else (non-Windows, or already a real .exe) spawns
+      // as-is with argv passed through verbatim — no shell, no quoting.
+      let child: ChildProcessWithoutNullStreams;
+      try {
+        const plan = planSpawn(this.sfCommand(), args);
+        child = spawn(plan.command, plan.args, {
+          shell: false,
+          windowsVerbatimArguments: plan.windowsVerbatimArguments
+        });
+      } catch (err) {
+        // planSpawn only throws when an argument can't be safely framed for the
+        // cmd.exe fallback (embedded quote/CR/LF) — a launch failure, not a
+        // "sf not found" condition, so notFound stays false. runJson() surfaces
+        // it via the empty-stdout branch since there is no process output.
+        resolve({ stdout: '', stderr: (err as Error).message, code: -1, notFound: false });
+        return;
+      }
       const finish = (code: number, killed: boolean) => {
         if (settled) return;
         settled = true;

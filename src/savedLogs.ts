@@ -53,9 +53,11 @@ export class SavedLogsService {
       }
       wrote = true;
     } catch (err) {
-      await fs.rm(logPath, { force: true });
-      await fs.rm(metaPath, { force: true });
-      if (summaryPath) await fs.rm(summaryPath, { force: true });
+      // Best-effort cleanup — a second failure here (same transient Windows lock
+      // that broke the write) must not REPLACE the original, more useful error.
+      await fs.rm(logPath, { force: true }).catch(() => undefined);
+      await fs.rm(metaPath, { force: true }).catch(() => undefined);
+      if (summaryPath) await fs.rm(summaryPath, { force: true }).catch(() => undefined);
       throw err;
     }
     return { wrote, logPath, metaPath, summaryPath };

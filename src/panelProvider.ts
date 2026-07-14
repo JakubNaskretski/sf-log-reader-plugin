@@ -1159,7 +1159,13 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
 
 function workspaceKey(workspace: vscode.WorkspaceFolder): string {
   const name = workspace.name.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 40) || 'workspace';
-  const hash = crypto.createHash('sha1').update(workspace.uri.fsPath).digest('hex').slice(0, 8);
+  // Fold drive-letter/path casing on win32 before hashing: NTFS treats the
+  // differently-cased strings VS Code can produce for one folder as the SAME
+  // directory — hashing them raw partitioned one workspace's logs under
+  // unreachable keys. (Migration-free: the plugin never worked on Windows
+  // before the spawn fix, so no existing Windows partitions exist.)
+  const keySource = process.platform === 'win32' ? workspace.uri.fsPath.toLowerCase() : workspace.uri.fsPath;
+  const hash = crypto.createHash('sha1').update(keySource).digest('hex').slice(0, 8);
   return `${name}-${hash}`;
 }
 

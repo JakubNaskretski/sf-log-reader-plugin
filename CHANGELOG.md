@@ -3,6 +3,15 @@
 All notable changes to the SF Log Reader extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.7.4
+
+- Fixed: **Windows support.** The `sf` CLI now launches on Windows (recent VS Code builds
+  refused to start `sf.cmd`). Log storage names are Windows-safe — an org alias like
+  `con` or `aux` (a reserved Windows device name) no longer breaks every fetch, trailing
+  dots and long usernames are handled, and casing is stable. Deleting logs tolerates the
+  brief file locks Windows antivirus takes on fresh files, and a locked file no longer
+  aborts the whole cleanup halfway through.
+
 ## 0.7.3
 
 - Fixed: **One flaky org listing can't deselect your org anymore.** The org list now skips

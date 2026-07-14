@@ -139,13 +139,23 @@ export class LogStore {
     const metas = await this.listStored(orgAlias);
     metas.sort((a, b) => (a.fetchedAt ?? '').localeCompare(b.fetchedAt ?? ''));
     let removed = 0;
+    let failed = 0;
     for (const meta of metas.slice(0, count)) {
       const userId = meta.LogUserId ?? 'unknown';
-      await fs.rm(this.logPath(meta.orgAlias!, userId, meta.Id), { force: true });
-      await fs.rm(this.metaPath(meta.orgAlias!, userId, meta.Id), { force: true });
-      await fs.rm(this.summaryPath(meta.orgAlias!, userId, meta.Id), { force: true });
-      removed += 1;
+      // Per-entry isolation + one retry: Windows AV/indexers hold brief locks on
+      // recently-written files (EBUSY/EPERM); one locked file must not abort the
+      // whole sweep and strand half-deleted entries (orphan .meta.json renders
+      // as a phantom log in listStored).
+      try {
+        await rmWithRetry(this.logPath(meta.orgAlias!, userId, meta.Id));
+        await rmWithRetry(this.metaPath(meta.orgAlias!, userId, meta.Id));
+        await rmWithRetry(this.summaryPath(meta.orgAlias!, userId, meta.Id));
+        removed += 1;
+      } catch {
+        failed += 1;
+      }
     }
+    if (failed > 0) throw new Error(`Deleted ${removed} log(s); ${failed} could not be removed (files may be locked — retry in a moment).`);
     return removed;
   }
 
@@ -162,12 +172,36 @@ export class LogStore {
   }
 }
 
+/** fs.rm with one delayed retry — Windows AV/indexer locks are transient; a
+ *  single immediate failure shouldn't surface as a hard error. force:true keeps
+ *  the ENOENT-tolerant semantics of the call sites this replaces. */
+async function rmWithRetry(target: string): Promise<void> {
+  try {
+    await fs.rm(target, { force: true });
+  } catch {
+    await new Promise(r => setTimeout(r, 200));
+    await fs.rm(target, { force: true });
+  }
+}
+
 function sanitize(input: string): string {
-  const cleaned = input.replace(/[^A-Za-z0-9._-]/g, '_');
+  let cleaned = input.replace(/[^A-Za-z0-9._-]/g, '_');
   // Never allow a path segment that is "." or ".." (directory traversal) — a
   // crafted/garbage logId/userId/orgAlias must stay inside the store root.
   if (/^\.+$/.test(cleaned)) return '_'.repeat(cleaned.length);
-  return cleaned;
+  // Windows extras (org ALIASES are freeform user text): reserved device names
+  // (CON, NUL, COM1…) are invalid path segments even with an extension; Win32
+  // silently strips trailing dots (=> "acme" and "acme." would share a dir); and
+  // an 80-char username-as-alias stacked under globalStorage can brush MAX_PATH.
+  // Case is folded on win32 only — NTFS is case-insensitive, so "DevOrg" and
+  // "devorg" were ALREADY one physical dir there; folding makes the code agree
+  // with the filesystem (no migration risk: the plugin never worked on Windows
+  // before this fix, so no existing Windows stores exist).
+  cleaned = cleaned.replace(/\.+$/, '_');
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i.test(cleaned)) cleaned = `_${cleaned}`;
+  if (cleaned.length > 64) cleaned = cleaned.slice(0, 64);
+  if (process.platform === 'win32') cleaned = cleaned.toLowerCase();
+  return cleaned || '_';
 }
 
 async function walkSize(dir: string): Promise<number> {
