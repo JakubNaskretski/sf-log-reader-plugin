@@ -4,7 +4,8 @@ import { SfCliService, normalizeApiVersion } from './sfCliService';
 import { SfRestService } from './restClient';
 import { OrgStore } from './orgStore';
 import { LogReaderPanelProvider, migrateLegacyStorage } from './panelProvider';
-import { getSharedOrg, migrateToSharedOrg, onSharedOrgChange } from './kit/orgs';
+import { getSharedOrg, onSharedOrgChange } from './kit/orgs';
+import { onOrgSyncEnabled, reconcileOrgOnActivation } from './orgSync';
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel('SF Log Reader');
@@ -24,21 +25,31 @@ export function activate(context: vscode.ExtensionContext): void {
     output.appendLine(`Legacy storage migration failed: ${(err as Error).message}`);
   });
 
-  // One-time seed of the shared cross-plugin org setting from this plugin's
-  // private key (no-ops once the shared setting is populated). Validates the
-  // private mirror against a live org list first so a stale one isn't resurrected
-  // into the family's shared setting. The setting SCHEMA is contributed by
-  // sf-org-deploy-helper only — we read/write it undeclared.
-  seedSharedOrg(sf, orgStore, output).catch(err =>
-    output.appendLine(`Shared-org seed failed: ${(err as Error).message}`)
+  // Reconcile our OWN org key against the family-shared setting: a one-time
+  // migration, then (only with sfLogReader.syncOrgWithFamily on) adopt the shared
+  // org. Never writes the shared setting — this plugin's org is its own unless
+  // the user opts into syncing. The shared setting's SCHEMA is contributed by
+  // sf-org-deploy-helper only — we read/watch it undeclared.
+  reconcileOrgOnActivation(context.globalState, orgStore).catch(err =>
+    output.appendLine(`Org sync reconcile failed: ${(err as Error).message}`)
   );
 
   context.subscriptions.push(
     output,
-    // React to org changes made by a sibling family plugin via the shared setting.
+    // React to org changes made by a sibling family plugin via the shared
+    // setting. The provider re-checks the sync flag at event time, so a change
+    // arriving while sync is off is ignored without needing a reload.
     onSharedOrgChange(username => {
       provider.onSharedOrgChanged(username).catch(err =>
         output.appendLine(`Shared-org change handling failed: ${(err as Error).message}`)
+      );
+    }),
+    // Turning sync ON adopts the family's current org right away — same path as
+    // the watcher above, which also drops an empty shared value (no org to
+    // adopt) and a value equal to ours. Turning sync off leaves the org alone.
+    onOrgSyncEnabled(() => {
+      provider.onSharedOrgChanged(getSharedOrg()).catch(err =>
+        output.appendLine(`Org sync enable handling failed: ${(err as Error).message}`)
       );
     }),
     vscode.window.registerWebviewViewProvider(LogReaderPanelProvider.viewType, provider),
@@ -71,35 +82,6 @@ export function activate(context: vscode.ExtensionContext): void {
       });
     });
   }
-}
-
-/**
- * Seed the shared cross-plugin org from this plugin's private mirror without ever
- * resurrecting a stale one. migrateToSharedOrg writes the private key into an
- * EMPTY shared setting unconditionally — so if the shared setting was cleared
- * (e.g. its org was deauthenticated) while this plugin wasn't running, a
- * long-gone mirror would be pushed back onto the whole family. Before seeding a
- * non-empty mirror into an empty shared setting, validate it against a fresh
- * `sf org list` (the safe --skip-connection-status flag, no wipe risk); when the
- * org is gone, skip the seed and clear the private mirror instead so the next
- * activation doesn't retry the resurrection. Otherwise behaviour is the plain
- * migrate-then-adopt (shared already set, or the mirror validates).
- */
-async function seedSharedOrg(sf: SfCliService, orgStore: OrgStore, output: vscode.OutputChannel): Promise<void> {
-  const privateValue = orgStore.getOrg();
-  // Only the empty-shared + non-empty-mirror case can resurrect a stale org;
-  // otherwise migrateToSharedOrg already no-ops (shared populated) or has nothing
-  // to seed. Validate just that case so we don't spawn `sf org list` needlessly.
-  if (!getSharedOrg() && privateValue && privateValue.trim()) {
-    const orgs = await sf.listOrgs();
-    if (!orgs.some(o => o.username === privateValue)) {
-      await orgStore.setOrg(undefined);
-      output.appendLine(`Shared-org seed skipped: private org ${privateValue} is no longer authenticated; cleared the stale mirror.`);
-      return;
-    }
-  }
-  const effective = await migrateToSharedOrg(privateValue);
-  if (effective && effective !== orgStore.getOrg()) await orgStore.setOrg(effective);
 }
 
 export function deactivate(): void {

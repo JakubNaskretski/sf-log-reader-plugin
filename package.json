@@ -2,7 +2,7 @@
   "name": "sf-log-reader",
   "displayName": "SF Log Reader",
   "description": "Browse, fetch, and filter Salesforce debug logs from any authenticated org, surfaced in a bottom-panel webview.",
-  "version": "0.7.4",
+  "version": "0.8.0",
   "publisher": "Skrety",
   "icon": "plugin-icon.png",
   "license": "MIT",
@@ -189,6 +189,12 @@
           "minimum": 5000,
           "maximum": 600000,
           "description": "Timeout in milliseconds for individual sf CLI invocations and REST requests."
+        },
+        "sfLogReader.syncOrgWithFamily": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "markdownDescription": "Follow and publish the Salesforce org shared across the Skrety SF plugins (`skrety.salesforce.targetOrg`). Off: this plugin keeps its own org and ignores switches made in sibling plugins."
         },
         "sfLogReader.apiVersion": {
           "type": "string",

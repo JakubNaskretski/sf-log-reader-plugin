@@ -29,6 +29,7 @@ A VS Code extension that surfaces Salesforce debug logs in a bottom-panel webvie
 | `sfLogReader.savedLogsFolder` | `""` (`~/sf-saved-logs`) | Where "Keep" copies logs. Same path rules as above. |
 | `sfLogReader.commandTimeoutMs` | `60000` | Timeout per `sf` CLI invocation / REST request. |
 | `sfLogReader.apiVersion` | `60.0` | API version for Tooling REST calls when set explicitly; otherwise the org's default is used. |
+| `sfLogReader.syncOrgWithFamily` | `false` | Follow and publish the org shared across the Skrety SF plugins. Off: this plugin keeps its own org and ignores org switches made in sibling plugins. |
 
 ## Roadmap
 
