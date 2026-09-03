@@ -15,7 +15,7 @@ import { generateSummary } from './summaryGenerator';
 import { SavedLogsService } from './savedLogs';
 import { capEntries } from './entryCap';
 import { TraceService } from './traceService';
-import { getSharedOrg, setSharedOrg } from './kit/orgs';
+import { publishSharedOrg, shouldAdoptSharedOrg } from './orgSync';
 import { buildAnalysis } from './analysisModel';
 import { buildCallTree } from './callTree';
 
@@ -142,7 +142,7 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
       matchOnDetail: true
     });
     if (picked) {
-      await this.setActiveOrg(picked.username);
+      await this.setActiveOrg(picked.username, { userInitiated: true });
       // Clear the previous org's user list — otherwise pickUser()/the dropdown
       // would show/merge stale users from the org we just switched away from
       // (mirrors the webview 'selectOrg' path).
@@ -481,7 +481,7 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
         await this.refreshStoredLogs();
         return;
       case 'selectOrg':
-        await this.setActiveOrg(message.username);
+        await this.setActiveOrg(message.username, { userInitiated: true });
         this.users = [];
         this.postOrgs();
         await this.refreshStoredLogs();
@@ -906,20 +906,15 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
     try {
       const timeoutMs = vscode.workspace.getConfiguration('sfLogReader').get<number>('commandTimeoutMs', 60_000);
       this.orgs = await this.sf.listOrgs(timeoutMs);
-      // Consider the shared cross-plugin setting, not just the private store, so
-      // an org chosen in a sibling plugin survives the auto-select below. Adopt
-      // it into the private store when present so postOrgs/getUser key on it.
       const current = this.effectiveOrgUsername();
-      // Clear the shared selection ONLY on a genuinely non-empty listing that
-      // omits the current org (a real "org gone"). A failed `sf org list` throws
-      // (caught below, this.orgs untouched, so the clear is unreachable), and an
-      // empty listing is treated as a transient blip — never a wipe. Clearing the
-      // shared setting off one flaky/empty result would yank the org out from
-      // under every sibling family plugin.
+      // Clear the selection ONLY on a genuinely non-empty listing that omits the
+      // current org (a real "org gone"). A failed `sf org list` throws (caught
+      // below, this.orgs untouched, so the clear is unreachable), and an empty
+      // listing is treated as a transient blip — never a wipe. None of these
+      // reconciliation writes are user picks, so none of them touch the shared
+      // cross-plugin setting.
       if (this.orgs.length > 0 && current && !this.orgs.some(o => o.username === current)) {
         await this.setActiveOrg(undefined);
-      } else if (current && this.orgStore.getOrg() !== current) {
-        await this.orgStore.setOrg(current);
       } else if (!current) {
         const defaultOrg = this.orgs.find(o => o.isDefaultUsername) ?? this.orgs[0];
         if (defaultOrg) await this.setActiveOrg(defaultOrg.username);
@@ -1046,33 +1041,55 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * Resolve the effective target-org username: the private store first, then the
-   * shared cross-plugin setting (`skrety.salesforce.targetOrg`) as a fallback so
-   * an org selected in a sibling family plugin is honored here too.
+   * Resolve the effective target-org username. This plugin's own store is the
+   * only source of truth — the family-shared setting is never read as a
+   * fallback; it reaches us (when `sfLogReader.syncOrgWithFamily` is on) only via
+   * onSharedOrgChanged, which writes it into the private store first.
    */
   private effectiveOrgUsername(): string | undefined {
-    return this.orgStore.getOrg() ?? getSharedOrg();
+    return this.orgStore.getOrg();
   }
 
   /**
-   * Persist a user-chosen target org to BOTH the private store and the shared
-   * cross-plugin setting (`skrety.salesforce.targetOrg`) so a switch here also
-   * moves sibling family plugins. The shared-org config watcher
-   * in extension.ts no-ops when the value is unchanged, so this doesn't loop.
+   * Persist the target org to this plugin's own store. `userInitiated` marks the
+   * two paths that are an actual user pick (palette picker / panel dropdown);
+   * only those publish to the shared cross-plugin setting, and only while
+   * `sfLogReader.syncOrgWithFamily` is on. Reconciliation and startup
+   * auto-select pass no flag, so they never move sibling plugins. The
+   * shared-org watcher no-ops on an unchanged value, so publishing can't loop.
    */
-  private async setActiveOrg(username: string | undefined): Promise<void> {
+  private async setActiveOrg(username: string | undefined, opts: { userInitiated?: boolean } = {}): Promise<void> {
     await this.orgStore.setOrg(username);
-    await setSharedOrg(username);
+    if (opts.userInitiated) await publishSharedOrg(username);
   }
+
+  /** Org currently being adopted, so the de-dup below survives the first
+   *  `await`: one settings.json save that changes both the sync flag and the
+   *  shared org fires two handlers back-to-back, and the second would otherwise
+   *  still read the pre-adoption org from the store and reload a second time. */
+  private adoptingOrg?: string;
 
   /**
    * React to a shared-org change made by a sibling plugin (or the user editing
-   * the setting): adopt it into the private store and refresh, but only when it
-   * actually differs from what we already have (avoids a redundant reload when
-   * we were the writer).
+   * the setting): adopt it into the private store and refresh — but only when
+   * `sfLogReader.syncOrgWithFamily` is on (checked here, at event time, so
+   * toggling the setting takes effect without a reload), when the value is
+   * actually set (clearing the family org never blanks our target) and when it
+   * differs from what we already have (avoids a redundant reload when we were
+   * the writer).
    */
   async onSharedOrgChanged(username: string | undefined): Promise<void> {
-    if (username === this.orgStore.getOrg()) return;
+    if (this.adoptingOrg === username) return; // adoption of this org already running
+    if (!shouldAdoptSharedOrg(username, this.orgStore.getOrg())) return;
+    this.adoptingOrg = username;
+    try {
+      await this.adoptSharedOrg(username);
+    } finally {
+      this.adoptingOrg = undefined;
+    }
+  }
+
+  private async adoptSharedOrg(username: string | undefined): Promise<void> {
     await this.orgStore.setOrg(username);
     // Drop the previous org's users from memory; the posts below replace them in
     // the webview too (clearing this.users alone leaves org-A's names rendered in
@@ -1099,16 +1116,11 @@ export class LogReaderPanelProvider implements vscode.WebviewViewProvider {
   /**
    * Ensure the org list is loaded and a target org is resolved before a palette
    * command that would otherwise fail cold (the panel — and its 'ready' load —
-   * may never have opened). Seeds the store from the shared setting when needed.
-   * Handles the palette-before-panel case.
+   * may never have opened). Handles the palette-before-panel case; when the
+   * private store is empty, loadOrgs' auto-select fills it (CLI default / first
+   * org) — the family-shared setting is never adopted here.
    */
   private async ensureOrgLoaded(): Promise<void> {
-    // Adopt a shared-setting org into the private store so requireOrg's in-memory
-    // lookup (and getUser keying) resolve it consistently.
-    if (!this.orgStore.getOrg()) {
-      const shared = getSharedOrg();
-      if (shared) await this.orgStore.setOrg(shared);
-    }
     if (this.orgs.length === 0) await this.loadOrgs();
   }
 

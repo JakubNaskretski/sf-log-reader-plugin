@@ -3,6 +3,14 @@
 All notable changes to the SF Log Reader extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.8.0
+
+- Added: **Your org is now your own.** Switching the org in SF Log Reader no longer switches
+  it in the other Skrety Salesforce extensions, and their switches no longer move yours.
+  Prefer the old shared behavior? Turn on `sfLogReader.syncOrgWithFamily` (off by default) —
+  it takes effect immediately, follows the shared org and publishes your picks to it. On the
+  first start after updating you keep the org you were already using.
+
 ## 0.7.4
 
 - Fixed: **Windows support.** The `sf` CLI now launches on Windows (recent VS Code builds
