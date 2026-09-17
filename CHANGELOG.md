@@ -3,6 +3,10 @@
 All notable changes to the SF Log Reader extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.9.0
+
+- **?** in the panel title opens a short guide — org and user, Fetch and Start Capturing, filters and search, Analysis / Timeline / Generate summary, Keep, the SF Command Log — with an **Open README** button for the full documentation.
+
 ## 0.8.0
 
 - Added: **Your org is now your own.** Switching the org in SF Log Reader no longer switches

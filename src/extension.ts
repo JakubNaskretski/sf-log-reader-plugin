@@ -66,7 +66,8 @@ export function activate(context: vscode.ExtensionContext): void {
       if (logId && userId) await provider.generateSummaryFor(logId, userId);
     }),
     registerSafe('sfLogReader.openLogFile', (uri?: vscode.Uri) => provider.openExternalLog(uri)),
-    registerSafe('sfLogReader.openSavedLogsFolder', () => provider.openSavedLogsFolder())
+    registerSafe('sfLogReader.openSavedLogsFolder', () => provider.openSavedLogsFolder()),
+    registerSafe('sfLogReader.help', () => showHelp(context))
   );
 
   // A rejected command handler (e.g. the org pick failing to save the shared
@@ -81,6 +82,31 @@ export function activate(context: vscode.ExtensionContext): void {
         });
       });
     });
+  }
+}
+
+// The "?" in the panel title: a short plain-text guide (a modal's detail renders no markdown).
+async function showHelp(context: vscode.ExtensionContext): Promise<void> {
+  const HELP = `1. Open the SF Log Reader tab in the bottom panel, next to Terminal.
+2. Pick an org in the toolbar, optionally a user, then Fetch downloads the latest logs.
+3. Start Capturing (the record icon in the panel title bar) sets a debug trace flag so the org keeps writing logs.
+4. Click a log to read it; toggle USER_DEBUG / SOQL / DML / EXCEPTION filters or search its text.
+5. Analysis and Timeline summarize a log; Generate summary writes a .summary.md next to the log file.
+6. Keep copies a log into your saved-logs folder, out of reach of storage cleanup.
+7. SF Command Log at the bottom records each sf CLI call and each REST batch, never access tokens.
+8. Needs the Salesforce CLI (sf) on your PATH and at least one authenticated org.`;
+  const choice = await vscode.window.showInformationMessage('SF Log Reader', { modal: true, detail: HELP }, 'Open README');
+  if (choice === 'Open README') {
+    // vsce ships the file as readme.md while the dev host has README.md: open whichever exists
+    for (const name of ['readme.md', 'README.md']) {
+      const uri = vscode.Uri.joinPath(context.extensionUri, name);
+      try {
+        await vscode.workspace.fs.stat(uri);
+        await vscode.commands.executeCommand('markdown.showPreview', uri);
+        return;
+      } catch { /* try the other spelling */ }
+    }
+    void vscode.window.showWarningMessage('README not found in the extension folder.');
   }
 }
 
