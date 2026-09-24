@@ -7,7 +7,8 @@ import { getSharedOrg, setSharedOrg } from './kit/orgs';
  *
  * The private OrgStore key is the source of truth: it is written on every
  * applied org change (user pick, follow-from-family, startup auto-select), and
- * the plugin always starts from it. The shared setting is only followed and
+ * the plugin always starts from it. That store is per window (`workspaceState`);
+ * only the migration flag below is machine-wide. The shared setting is only followed and
  * only published when `sfLogReader.syncOrgWithFamily` is ON (default OFF) — with
  * it off, switching orgs here never moves a sibling plugin and a switch made in
  * a sibling is ignored here.
@@ -24,8 +25,9 @@ const SYNC_SETTING_NAME = 'syncOrgWithFamily';
 export const SYNC_SETTING = `${CONFIG_SECTION}.${SYNC_SETTING_NAME}`;
 
 /**
- * globalState flag for the one-time private-key migration below. Versioned so a
- * future re-migration can use a new key.
+ * globalState flag for the one-time private-key migration below — it must run
+ * once per install, not once per window, so it stays machine-wide. Versioned so
+ * a future re-migration can use a new key.
  */
 export const ORG_SYNC_MIGRATION_KEY = 'sfLogReader.orgSyncMigrated.v1';
 
@@ -33,6 +35,8 @@ export const ORG_SYNC_MIGRATION_KEY = 'sfLogReader.orgSyncMigrated.v1';
 export interface OrgMirror {
   getOrg(): string | undefined;
   setOrg(username: string | undefined): Promise<void>;
+  /** Copy the org (and its debug user) left machine-wide by older releases. */
+  adoptLegacy(legacyState: vscode.Memento): Promise<void>;
 }
 
 /** True when this plugin currently follows/publishes the family-shared org. */
@@ -68,7 +72,13 @@ export function shouldAdoptSharedOrg(username: string | undefined, privateValue:
 /**
  * Activation-time reconciliation of the private key against the shared setting.
  *
- * (a) One-time migration, regardless of the sync flag: on the first activation
+ * (a) Legacy port-forward, once per window: on its first activation a window
+ *     with no org of its own adopts the org (and the remembered debug users)
+ *     older releases kept machine-wide, so an upgrade never retargets a window
+ *     to the CLI default behind the user's back. The hop is stamped in the
+ *     window store, so an org cleared later stays cleared. See
+ *     `OrgStore.adoptLegacy` — `memento` is READ-ONLY for this.
+ * (b) One-time migration, regardless of the sync flag: on the first activation
  *     after this feature ships, a set shared org is copied into the private key
  *     so the plugin keeps the org the family was actually on instead of falling
  *     back to a possibly long-stale private mirror. The globalState flag is then
@@ -76,14 +86,24 @@ export function shouldAdoptSharedOrg(username: string | undefined, privateValue:
  *     was nothing to copy. Leaving it unstamped would arm the migration for some
  *     later activation, where a sync-off plugin would silently adopt whatever
  *     org a sibling had written in the meantime. It must run exactly once per
- *     install.
- * (b) Then, only when sync is ON, adopt a shared org that differs from ours.
+ *     install — so on an install that has not stamped the flag yet, the adoption
+ *     happens in whichever window activates first; the others keep the org (a)
+ *     ported forward.
+ * (c) Then, only when sync is ON, adopt a shared org that differs from ours.
  *
  * Nothing here writes the shared setting — the old "seed the empty shared
  * setting from our private mirror" step (and the `sf org list` validation that
  * kept it from resurrecting a dead org) is gone.
+ *
+ * `memento` is the machine-wide `context.globalState`: it is WRITTEN only for
+ * the migration flag, and read (never written) by the one-per-window legacy
+ * port-forward in (a).
+
+ * The org is read and written exclusively through `store`, which is
+ * workspace-scoped.
  */
 export async function reconcileOrgOnActivation(memento: vscode.Memento, store: OrgMirror): Promise<void> {
+  await store.adoptLegacy(memento);
   const shared = getSharedOrg();
   if (!memento.get<boolean>(ORG_SYNC_MIGRATION_KEY)) {
     if (shared && shared !== store.getOrg()) await store.setOrg(shared);
