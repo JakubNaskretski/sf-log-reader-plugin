@@ -18,7 +18,9 @@ export function activate(context: vscode.ExtensionContext): void {
     const explicit = inspected?.workspaceFolderValue ?? inspected?.workspaceValue ?? inspected?.globalValue;
     return explicit ? normalizeApiVersion(explicit) : undefined;
   });
-  const orgStore = new OrgStore(context.globalState);
+  // Per window: the org (and its debug user) lives in workspaceState, so two
+  // windows on two projects never fetch each other's logs.
+  const orgStore = new OrgStore(context.workspaceState);
   const provider = new LogReaderPanelProvider(context, sf, rest, orgStore, trail, output);
 
   migrateLegacyStorage(context).catch(err => {
@@ -29,7 +31,11 @@ export function activate(context: vscode.ExtensionContext): void {
   // migration, then (only with sfLogReader.syncOrgWithFamily on) adopt the shared
   // org. Never writes the shared setting — this plugin's org is its own unless
   // the user opts into syncing. The shared setting's SCHEMA is contributed by
-  // sf-org-deploy-helper only — we read/watch it undeclared.
+  // sf-org-deploy-helper only — we read/watch it undeclared. globalState here is
+  // WRITTEN only for the once-per-install migration flag, and READ once per
+  // window (stamped) for the legacy port-forward; otherwise the org lives in
+  // orgStore (workspaceState).
+
   reconcileOrgOnActivation(context.globalState, orgStore).catch(err =>
     output.appendLine(`Org sync reconcile failed: ${(err as Error).message}`)
   );

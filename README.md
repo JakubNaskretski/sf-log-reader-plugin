@@ -5,7 +5,7 @@ A VS Code extension that surfaces Salesforce debug logs in a bottom-panel webvie
 ## Features
 
 - **Bottom panel webview** — opens next to the Terminal/Problems panel, not a sidebar.
-- **Multi-org support** — discovers all authenticated `sf` orgs and remembers the selected one.
+- **Multi-org support** — discovers all authenticated `sf` orgs and remembers the selected one per VS Code window (workspace).
 - **Fast, progressive fetch** — log headers and bodies download over the Salesforce REST API (session resolved once per org via the CLI, then plain HTTPS), so a batch takes seconds instead of one CLI process per log. The list shows up immediately, newest first, and rows flip from "downloading…" to ready as bodies stream in — click a pending row to jump it to the front of the queue.
 - **User filter** — fetch logs only for a specific user (yourself or someone else with logs in the org).
 - **Local cache, no overwrite** — by default downloaded logs live in the extension's private global storage (partitioned per workspace), so they never clutter your workspace or git. Set `sfLogReader.logFolderName` to a path (workspace-relative, absolute, or `~`-prefixed) if you'd rather keep them next to your code. Existing logs are never overwritten; old logs are preserved until you explicitly delete them.
@@ -29,7 +29,7 @@ A VS Code extension that surfaces Salesforce debug logs in a bottom-panel webvie
 | `sfLogReader.savedLogsFolder` | `""` (`~/sf-saved-logs`) | Where "Keep" copies logs. Same path rules as above. |
 | `sfLogReader.commandTimeoutMs` | `60000` | Timeout per `sf` CLI invocation / REST request. |
 | `sfLogReader.apiVersion` | `60.0` | API version for Tooling REST calls when set explicitly; otherwise the org's default is used. |
-| `sfLogReader.syncOrgWithFamily` | `false` | Follow and publish the org shared across the Skrety SF plugins. Off: this plugin keeps its own org and ignores org switches made in sibling plugins. |
+| `sfLogReader.syncOrgWithFamily` | `false` | Follow and publish the org shared across the Skrety SF plugins. Off: this plugin keeps its own org and ignores org switches made in sibling plugins. The shared org is machine-wide, so with sync on every VS Code window follows the same org; with it off each window keeps its own. |
 
 ## Roadmap
 

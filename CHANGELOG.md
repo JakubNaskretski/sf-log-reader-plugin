@@ -3,6 +3,16 @@
 All notable changes to the SF Log Reader extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.10.0
+
+- **Your org is now per window.** Each VS Code window remembers its own target org and the
+  debug user picked for it, so two projects open side by side fetch logs from two different
+  orgs, and switching the org in one window no longer moves the other. On the first start
+  after updating every window begins on the org and user SF Log Reader last used on this machine, so nothing
+  changes until you pick — check the status bar in each window and pick once where it
+  differs; from then on each window keeps its choice. With `sfLogReader.syncOrgWithFamily`
+  on, the shared org is still machine-wide, so all windows follow it together.
+
 ## 0.9.0
 
 - **?** in the panel title opens a short guide — org and user, Fetch and Start Capturing, filters and search, Analysis / Timeline / Generate summary, Keep, the SF Command Log — with an **Open README** button for the full documentation.
